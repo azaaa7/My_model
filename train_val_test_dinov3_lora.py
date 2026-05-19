@@ -120,59 +120,238 @@ def add_peft_lora_to_backbone(
     return backbone, lora_layers
 
 
-class ConvBNReLU(nn.Sequential):
-    def __init__(self, in_channels: int, out_channels: int, kernel_size: int = 3):
+# ── Helper blocks (GN-based) ──────────────────────────────────────────────
+
+class ConvGNGLU(nn.Sequential):
+    """Conv2d + GroupNorm + GELU"""
+    def __init__(self, in_channels: int, out_channels: int, kernel_size: int = 3, stride: int = 1, num_groups: int = 16):
         padding = kernel_size // 2
+        gn_groups = min(num_groups, out_channels)
         super().__init__(
-            nn.Conv2d(in_channels, out_channels, kernel_size=kernel_size, padding=padding, bias=False),
-            nn.BatchNorm2d(out_channels),
-            nn.ReLU(inplace=True),
+            nn.Conv2d(in_channels, out_channels, kernel_size=kernel_size, stride=stride, padding=padding, bias=False),
+            nn.GroupNorm(gn_groups, out_channels),
+            nn.GELU(),
         )
 
 
-class DINOv3HighFreqDecoder(nn.Module):
-    def __init__(self, in_channels: int = DINOV3_FEATURE_DIM, decoder_channels: int = 256):
+class LayerNormChannel(nn.Module):
+    """LayerNorm applied over channel dim for 4D conv features [B, C, H, W]."""
+    def __init__(self, channels: int):
         super().__init__()
-        if decoder_channels < 4:
-            raise ValueError(f"decoder_channels must be >= 4, got {decoder_channels}")
+        self.norm = nn.LayerNorm(channels)
 
-        c1 = decoder_channels
-        c2 = decoder_channels // 2
-        c3 = decoder_channels // 4
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, C, H, W = x.shape
+        x = x.reshape(B, C, -1).transpose(1, 2)  # [B, HW, C]
+        x = self.norm(x)
+        return x.transpose(1, 2).reshape(B, C, H, W)
 
-        self.proj = ConvBNReLU(in_channels, c1)
-        self.refine_8 = ConvBNReLU(c1, c2)
-        self.high_freq = nn.Sequential(
-            ConvBNReLU(3, c3),
-            ConvBNReLU(c3, c3),
+
+class ResidualBlockGN(nn.Module):
+    """Conv3×3 → GN → GELU → Conv3×3 → GN → GELU + skip connection"""
+    def __init__(self, channels: int, num_groups: int = 16):
+        super().__init__()
+        gn_groups = min(num_groups, channels)
+        self.block = nn.Sequential(
+            nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False),
+            nn.GroupNorm(gn_groups, channels),
+            nn.GELU(),
+            nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False),
+            nn.GroupNorm(gn_groups, channels),
         )
-        self.fuse_refine = nn.Sequential(
-            ConvBNReLU(c2 + c3, c2),
-            ConvBNReLU(c2, c3),
+        self.act = nn.GELU()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.act(x + self.block(x))
+
+
+# ── DINOv3 Multi-layer Patch Encoder ──────────────────────────────────────
+
+class DinoMultiLayerPatchEncoder(nn.Module):
+    """Extract multi-layer DINOv3 patch tokens and fuse into unified features.
+
+    Args:
+        backbone: DINOv3 VisionTransformer
+        selected_layers: list of 0-indexed block indices to extract (default [5,11,17,23])
+        out_dim: target fusion channel dimension (default 256)
+        freeze_backbone: whether backbone params require grad
+        use_lora: whether LoRA was injected on backbone
+    """
+    def __init__(
+        self,
+        backbone: nn.Module,
+        selected_layers: list[int] | None = None,
+        out_dim: int = 256,
+        freeze_backbone: bool = True,
+        use_lora: bool = False,
+    ):
+        super().__init__()
+        self.backbone = backbone
+        self.selected_layers = selected_layers or [5, 11, 17, 23]
+        self.num_layers = len(self.selected_layers)
+        self.freeze_backbone = freeze_backbone
+        self.use_lora = use_lora
+
+        # Per-layer projector: LN → Conv1×1 (embed_dim → out_dim)
+        self.layer_projectors = nn.ModuleList()
+        for _ in range(self.num_layers):
+            self.layer_projectors.append(nn.Sequential(
+                LayerNormChannel(DINOV3_FEATURE_DIM),
+                nn.Conv2d(DINOV3_FEATURE_DIM, out_dim, kernel_size=1, bias=False),
+            ))
+
+        # Fusion: concat(num_layers * out_dim) → out_dim
+        fusion_in = self.num_layers * out_dim
+        self.fusion = nn.Sequential(
+            nn.Conv2d(fusion_in, out_dim * 2, kernel_size=1, bias=False),
+            nn.GroupNorm(min(16, out_dim * 2), out_dim * 2),
+            nn.GELU(),
+            nn.Conv2d(out_dim * 2, out_dim, kernel_size=3, padding=1, bias=False),
+            nn.GroupNorm(min(16, out_dim), out_dim),
+            nn.GELU(),
         )
-        self.final_refine = ConvBNReLU(c3, c3)
-        self.pred = nn.Conv2d(c3, 1, kernel_size=1)
 
-    def forward(self, feats: torch.Tensor, frames: torch.Tensor) -> torch.Tensor:
-        _, _, height, width = frames.shape
-        x = self.proj(feats)
+        # ImageNet normalization buffers
+        mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
+        std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
+        self.register_buffer("image_mean", mean)
+        self.register_buffer("image_std", std)
+
+    def forward(self, video: torch.Tensor) -> torch.Tensor:
+        """Extract fused multi-layer features.
+
+        Args:
+            video: [B, T, 3, H, W] RGB in [0, 1]
+
+        Returns:
+            fused_features: [B, T, out_dim, H//16, W//16]
+        """
+        B, T, C, H, W = video.shape
+        frames = video.reshape(B * T, C, H, W)
+        normalized = (frames - self.image_mean) / self.image_std
+
+        with torch.set_grad_enabled(not (self.freeze_backbone and not self.use_lora)):
+            layer_outputs = self.backbone.get_intermediate_layers(
+                normalized, n=self.selected_layers, reshape=True, norm=True
+            )
+
+        projected = []
+        for i, feats in enumerate(layer_outputs):
+            proj = self.layer_projectors[i](feats)
+            projected.append(proj)
+
+        concat = torch.cat(projected, dim=1)
+        fused = self.fusion(concat)
+
+        return fused.reshape(B, T, *fused.shape[1:])
+
+
+# ── High-frequency Boundary Branch ────────────────────────────────────────
+
+# ── Progressive Upsampling Decoder ────────────────────────────────────────
+
+class ProgressiveDecoder(nn.Module):
+    """Progressive upsampling decoder without boundary guidance.
+
+    Generates coarse_mask_logits internally from encoder feature,
+    then progressively upsamples from 1/16 to full resolution.
+
+    Args:
+        encoder_dim: channel dimension from encoder (default 256)
+        num_groups: GroupNorm groups
+    """
+    def __init__(
+        self,
+        encoder_dim: int = 256,
+        num_groups: int = 16,
+    ):
+        super().__init__()
+        self.encoder_dim = encoder_dim
+
+        # Coarse mask head (generated from encoder feature)
+        self.coarse_head = nn.Conv2d(encoder_dim, 1, kernel_size=1)
+
+        # 1/16 fusion: concat(encoder_feature + coarse_mask) → encoder_dim
+        self.fuse_16 = nn.Sequential(
+            nn.Conv2d(encoder_dim + 1, encoder_dim, kernel_size=1, bias=False),
+            nn.GroupNorm(min(num_groups, encoder_dim), encoder_dim),
+            nn.GELU(),
+            nn.Conv2d(encoder_dim, encoder_dim, kernel_size=3, padding=1, bias=False),
+            nn.GroupNorm(min(num_groups, encoder_dim), encoder_dim),
+            nn.GELU(),
+        )
+
+        # 1/16 → 1/8: 256 → 192
+        self.up_8 = nn.Sequential(
+            nn.Conv2d(encoder_dim, 192, kernel_size=3, padding=1, bias=False),
+            nn.GroupNorm(min(num_groups, 192), 192),
+            nn.GELU(),
+            nn.Conv2d(192, 192, kernel_size=3, padding=1, bias=False),
+            nn.GroupNorm(min(num_groups, 192), 192),
+            nn.GELU(),
+        )
+
+        # 1/8 → 1/4: 192 → 128
+        self.up_4 = nn.Sequential(
+            nn.Conv2d(192, 128, kernel_size=3, padding=1, bias=False),
+            nn.GroupNorm(min(num_groups, 128), 128),
+            nn.GELU(),
+            nn.Conv2d(128, 128, kernel_size=3, padding=1, bias=False),
+            nn.GroupNorm(min(num_groups, 128), 128),
+            nn.GELU(),
+        )
+
+        # 1/4 → Full resolution (two-step refinement)
+        self.head_1 = nn.Sequential(
+            nn.Conv2d(128, 64, kernel_size=3, padding=1, bias=False),
+            nn.GroupNorm(min(num_groups, 64), 64),
+            nn.GELU(),
+        )
+        self.head_2 = nn.Sequential(
+            nn.Conv2d(64, 32, kernel_size=3, padding=1, bias=False),
+            nn.GroupNorm(min(num_groups, 32), 32),
+            nn.GELU(),
+        )
+        self.head_pred = nn.Conv2d(32, 1, kernel_size=1)
+
+    def forward(self, encoder_feature_t: torch.Tensor) -> torch.Tensor:
+        """Decode mask from encoder feature.
+
+        Args:
+            encoder_feature_t: [B, encoder_dim, h, w]
+
+        Returns:
+            mask_logits: [B, 1, H, W]
+        """
+        # Coarse mask logits from encoder feature
+        coarse_mask = self.coarse_head(encoder_feature_t)  # [B, 1, h, w]
+
+        # 1/16 fusion
+        d_16 = torch.cat([encoder_feature_t, coarse_mask], dim=1)
+        d_16 = self.fuse_16(d_16)  # [B, encoder_dim, h, w]
+
+        # 1/16 → 1/8
+        d_8 = F.interpolate(d_16, scale_factor=2, mode="bilinear", align_corners=False)
+        d_8 = self.up_8(d_8)  # [B, 192, H/8, W/8]
+
+        # 1/8 → 1/4
+        d_4 = F.interpolate(d_8, scale_factor=2, mode="bilinear", align_corners=False)
+        d_4 = self.up_4(d_4)  # [B, 128, H/4, W/4]
+
+        # 1/4 → Full
+        x = F.interpolate(d_4, scale_factor=2, mode="bilinear", align_corners=False)
+        x = self.head_1(x)      # [B, 64, H/2, W/2]
         x = F.interpolate(x, scale_factor=2, mode="bilinear", align_corners=False)
-        x = self.refine_8(x)
-        x = F.interpolate(x, scale_factor=2, mode="bilinear", align_corners=False)
+        x = self.head_2(x)      # [B, 32, H, W]
+        mask_logits = self.head_pred(x)  # [B, 1, H, W]
 
-        high_freq = F.interpolate(frames, size=x.shape[-2:], mode="bilinear", align_corners=False)
-        high_freq = self.high_freq(high_freq)
-        x = torch.cat([x, high_freq], dim=1)
-        x = self.fuse_refine(x)
-
-        x = F.interpolate(x, size=(height, width), mode="bilinear", align_corners=False)
-        x = self.final_refine(x)
-        return self.pred(x)
+        return mask_logits
 
 
 class DINOv3ViTL16InpaintingDetector(nn.Module):
     """
-    DINOv3 ViT-L/16 comparison model.
+    DINOv3 ViT-L/16 comparison model with multi-layer encoder and
+    frequency-guided boundary decoder.
 
     This matches the official hub model named dinov3_vitl16 and the local
     weight file dinov3_vitl16_pretrain_lvd1689m-8aa4cbdd.pth.
@@ -181,12 +360,15 @@ class DINOv3ViTL16InpaintingDetector(nn.Module):
         clip: [B, T, 3, H, W], RGB in [0, 1]
 
     Output:
-        logits: [B, T, 1, H, W]
+        mask_logits: [B, T, 1, H, W]
+        or dict with "mask_logits" and "edge_logits" when use_edge_head=True
     """
 
     def __init__(
         self,
         backbone: nn.Module,
+        selected_layers: list[int] | None = None,
+        encoder_dim: int = 256,
         decoder_channels: int = 256,
         freeze_backbone: bool = True,
         use_lora: bool = False,
@@ -200,15 +382,7 @@ class DINOv3ViTL16InpaintingDetector(nn.Module):
         self.freeze_backbone = freeze_backbone
         self.use_lora = use_lora
 
-        mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
-        std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
-        self.register_buffer("image_mean", mean)
-        self.register_buffer("image_std", std)
-
-        if freeze_backbone:
-            for param in self.backbone.parameters():
-                param.requires_grad = False
-
+        # LoRA injection (before freezing so LoRA params stay trainable)
         self.lora_layers = 0
         if use_lora:
             if lora_rank <= 0:
@@ -223,10 +397,22 @@ class DINOv3ViTL16InpaintingDetector(nn.Module):
             if self.lora_layers == 0:
                 raise RuntimeError(f"No DINOv3 Linear layers matched LoRA targets: {lora_targets}")
 
-        self.decoder = DINOv3HighFreqDecoder(
-            in_channels=DINOV3_FEATURE_DIM,
-            decoder_channels=decoder_channels,
+        # Freeze backbone (LoRA params remain trainable)
+        if freeze_backbone:
+            for param in self.backbone.parameters():
+                param.requires_grad = False
+
+        # Multi-layer encoder
+        self.encoder = DinoMultiLayerPatchEncoder(
+            backbone=self.backbone,
+            selected_layers=selected_layers or [5, 11, 17, 23],
+            out_dim=encoder_dim,
+            freeze_backbone=freeze_backbone,
+            use_lora=use_lora,
         )
+
+        # Progressive decoder
+        self.decoder = ProgressiveDecoder(encoder_dim=encoder_dim)
 
     def forward(self, clip: torch.Tensor) -> torch.Tensor:
         if clip.ndim != 5:
@@ -236,15 +422,17 @@ class DINOv3ViTL16InpaintingDetector(nn.Module):
         if channels != 3:
             raise ValueError(f"clip channel dimension must be 3, got {channels}")
 
-        frames = clip.reshape(batch_size * num_frames, channels, height, width)
-        normalized_frames = (frames - self.image_mean) / self.image_std
-        if self.freeze_backbone and not self.use_lora:
-            with torch.no_grad():
-                feats = self.backbone.get_intermediate_layers(normalized_frames, n=1, reshape=True, norm=True)[0]
-        else:
-            feats = self.backbone.get_intermediate_layers(normalized_frames, n=1, reshape=True, norm=True)[0]
-        logits = self.decoder(feats, frames)
-        return logits.reshape(batch_size, num_frames, 1, height, width)
+        # 1. Multi-layer encoder → [B, T, encoder_dim, h, w]
+        encoder_features = self.encoder(clip)
+
+        # 2. Decode per frame
+        logits_list: list[torch.Tensor] = []
+        for t in range(num_frames):
+            enc_t = encoder_features[:, t]  # [B, encoder_dim, h, w]
+            logits = self.decoder(enc_t)    # [B, 1, H, W]
+            logits_list.append(logits)
+
+        return torch.stack(logits_list, dim=1)  # [B, T, 1, H, W]
 
 
 def validate_config(cfg: dict[str, Any], mode: str) -> None:
@@ -278,9 +466,28 @@ def validate_config(cfg: dict[str, Any], mode: str) -> None:
         errors.append(f"checkpoint does not exist: {cfg['checkpoint']}")
     if int(cfg.get("lora_rank", 0)) < 0:
         errors.append("lora_rank must be >= 0")
+    if int(cfg.get("encoder_dim", 0)) <= 0:
+        errors.append("encoder_dim must be > 0")
+    if int(cfg.get("encoder_dim", 0)) % 16 != 0:
+        errors.append("encoder_dim should be divisible by 16 (GroupNorm-friendly)")
+    selected = cfg.get("selected_layers")
+    if not selected or not isinstance(selected, (list, tuple)):
+        errors.append(f"selected_layers must be a non-empty list, got {selected}")
+    else:
+        for idx in selected:
+            if not isinstance(idx, int) or idx < 0 or idx > 23:
+                errors.append(f"selected_layers entry {idx} is out of range [0, 23] for ViT-L/24")
 
     if errors:
         raise ValueError("Config validation failed:\n  - " + "\n  - ".join(errors))
+
+    # GPU ID 范围检查
+    gpu_id = int(cfg.get("gpu_id", 0))
+    if gpu_id < 0:
+        raise ValueError(f"gpu_id must be >= 0, got {gpu_id}")
+    if torch.cuda.is_available() and gpu_id >= torch.cuda.device_count():
+        print(f"[warning] gpu_id={gpu_id} >= available devices ({torch.cuda.device_count()}), "
+              f"fallback to cuda:0 or CUDA_VISIBLE_DEVICES")
 
 
 def build_model(cfg: dict[str, Any], device: torch.device, base_dir: Path) -> DINOv3ViTL16InpaintingDetector:
@@ -288,6 +495,8 @@ def build_model(cfg: dict[str, Any], device: torch.device, base_dir: Path) -> DI
     lora_targets = tuple(str(item).strip() for item in str(cfg.get("lora_targets", "attn.qkv,attn.proj")).split(",") if str(item).strip())
     model = DINOv3ViTL16InpaintingDetector(
         backbone=backbone,
+        selected_layers=[int(x) for x in cfg.get("selected_layers", [5, 11, 17, 23])],
+        encoder_dim=int(cfg.get("encoder_dim", 256)),
         decoder_channels=int(cfg.get("decoder_channels", 256)),
         freeze_backbone=bool(cfg.get("freeze_backbone", True)),
         use_lora=bool(cfg.get("use_lora", False)),
@@ -304,7 +513,9 @@ def build_model(cfg: dict[str, Any], device: torch.device, base_dir: Path) -> DI
         print(f"[checkpoint] loaded: {checkpoint}")
 
     total, trainable = count_parameters(model)
-    print(f"[model] DINOv3 ViT-L/16 pretrained backbone, LoRA layers: {model.lora_layers}")
+    selected = cfg.get("selected_layers", [5, 11, 17, 23])
+    print(f"[model] DINOv3 ViT-L/16 multi-layer encoder, layers={list(selected)}, "
+          f"LoRA layers: {model.lora_layers}")
     print(f"[params] total {total:,} trainable {trainable:,}")
     return model.to(device)
 
@@ -576,6 +787,8 @@ def main() -> None:
     parser.add_argument("--learning_rate", type=float, default=None)
     parser.add_argument("--weight_decay", type=float, default=None)
     parser.add_argument("--decoder_channels", type=int, default=None)
+    parser.add_argument("--selected_layers", type=int, nargs="*", default=None)
+    parser.add_argument("--encoder_dim", type=int, default=None)
     parser.add_argument("--freeze_backbone", type=str2bool, default=None)
     parser.add_argument("--use_lora", type=str2bool, default=None)
     parser.add_argument("--lora_rank", type=int, default=None)
@@ -585,6 +798,7 @@ def main() -> None:
     parser.add_argument("--save_dir", type=str, default=None)
     parser.add_argument("--visualization_dir", type=str, default=None)
     parser.add_argument("--device", type=str, default=None)
+    parser.add_argument("--gpu_id", type=int, default=None)
     args = parser.parse_args()
 
     cfg_path = resolve_config_path(args.config)
@@ -602,11 +816,14 @@ def main() -> None:
         "lora_dropout": 0.0,
         "lora_targets": ",".join(DEFAULT_LORA_TARGETS),
         "decoder_channels": 256,
+        "selected_layers": [5, 11, 17, 23],
+        "encoder_dim": 256,
         "save_dir": "runs/dinov3_vitl16",
         "visualization_dir": "runs/dinov3_vitl16/vis",
         "checkpoint": "",
         "grad_accum_steps": 1,
         "eval_frame_chunk": 1,
+        "gpu_id": 0,
     }
     for key, value in defaults.items():
         cfg.setdefault(key, value)
@@ -628,10 +845,19 @@ def main() -> None:
     validate_config(cfg, mode)
 
     set_seed(int(cfg.get("seed", 666666)))
-    device = torch.device(cfg.get("device") or ("cuda" if torch.cuda.is_available() else "cpu"))
-    print(f"[device] {device}")
+    device_str = cfg.get("device", "")
+    gpu_id = int(cfg.get("gpu_id", 0))
+    if not device_str:
+        if torch.cuda.is_available():
+            device_str = f"cuda:{gpu_id}"
+        else:
+            device_str = "cpu"
+    device = torch.device(device_str)
+    print(f"[device] {device} (gpu_id={gpu_id})")
     print(f"[mode] {mode}")
     print(f"[dinov3] model={DINOV3_MODEL_NAME} weights={cfg['dinov3_weights']}")
+    print(f"[dinov3] encoder: multi-layer, layers={cfg.get('selected_layers', [5, 11, 17, 23])}, "
+          f"encoder_dim={int(cfg.get('encoder_dim', 256))}")
     print(f"[lora] enabled={bool(cfg.get('use_lora', False))} rank={int(cfg.get('lora_rank', 4))}")
 
     if mode == "train":
