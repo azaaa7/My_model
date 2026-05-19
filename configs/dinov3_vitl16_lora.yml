@@ -1,0 +1,58 @@
+type: train
+
+# Data
+# *_samples accepts one .npy path or any number of .npy paths.
+train_samples:
+  # - "./flist/DAVIS-VI_tra_DVI_30.npy"
+  - "./flist/DAVIS-VI_tra_CPNET_30.npy"
+  - "./flist/DAVIS-VI_tra_OPN_30.npy"
+val_samples:
+  # - "./flist/DAVIS-VI_val_DVI_20.npy"
+  - "./flist/DAVIS-VI_val_CPNET_20.npy"
+  - "./flist/DAVIS-VI_val_OPN_20.npy"
+test_samples:
+  - "./flist/DAVIS-VI_val_OPN_20.npy"
+  # - "./flist/DAVIS-VI_val_DVI_20.npy"
+  # - "./flist/DAVIS-VI_val_CPNET_20.npy"
+input_size: 512
+gt_ratio: 1
+num_frames: 1
+batch_size: 16
+num_workers: 6
+
+# DINOv3 ViT-L/16 pretrained backbone.
+# Place the weight file in My_model/ or replace this with an absolute path.
+dinov3_weights: "./runs/dinov3_vitl16/dinov3_vitl16_pretrain_lvd1689m-8aa4cbdd.pth"
+
+# Prefer a local clone of https://github.com/facebookresearch/dinov3.
+# If empty, the script checks ./dinov3, ../dinov3, and cwd/dinov3.
+dinov3_repo: "./dinov3"
+allow_hub_download: false
+
+# Model
+freeze_backbone: true
+decoder_channels: 256
+checkpoint: ""
+
+# Optional LoRA fine-tuning for DINOv3 ViT attention layers.
+# Default targets match official DINOv3 block names: blocks.*.attn.qkv/proj.
+use_lora: false
+lora_rank: 4
+lora_alpha: 8.0
+lora_dropout: 0.0
+lora_targets: "attn.qkv,attn.proj"
+
+# Train
+n_epochs: 1000
+learning_rate: 1.0e-4
+weight_decay: 0.0
+seed: 666666
+amp: true
+grad_accum_steps: 1
+validate_every: 20
+threshold: 0.5
+eval_frame_chunk: 5
+
+# Output
+save_dir: "runs/dinov3_vitl16"
+visualization_dir: "runs/dinov3_vitl16/vis"

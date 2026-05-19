@@ -1,0 +1,35 @@
+type: train
+
+# Data
+train_samples: "./flist/DAVIS-VI_tra_DVI_30.npy"
+val_samples: "./flist/DAVIS-VI_val_DVI_20.npy"
+test_samples: "./flist/DAVIS-VI_val_CPNET_20.npy"
+input_size: 512
+gt_ratio: 1
+num_frames: 1
+batch_size: 2
+num_workers: 4
+
+# Model
+freeze_backbone: true
+decoder_channels: 256
+checkpoint: ""
+
+# Optional LoRA fine-tuning for ConvNeXt Linear layers.
+use_lora: false
+lora_rank: 4
+lora_alpha: 8.0
+lora_dropout: 0.0
+
+# Train
+n_epochs: 1000
+learning_rate: 1.0e-4
+weight_decay: 0.0
+seed: 666666
+amp: true
+validate_every: 10
+threshold: 0.5
+
+# Output
+save_dir: "runs/convnext_tiny"
+visualization_dir: "runs/convnext_tiny/vis"

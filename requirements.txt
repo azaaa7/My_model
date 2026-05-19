@@ -1,0 +1,7 @@
+numpy
+torch
+torchvision
+opencv-python
+albumentations
+PyYAML
+peft
