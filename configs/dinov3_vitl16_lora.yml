@@ -12,8 +12,8 @@ val_samples:
   - "./flist/DAVIS-VI_val_OPN_20.npy"
 test_samples:
   # - "./flist/DAVIS-VI_val_OPN_20.npy"
-  # - "./flist/DAVIS-VI_val_DVI_20.npy"
-  - "./flist/DAVIS-VI_val_CPNET_20.npy"
+  - "./flist/DAVIS-VI_val_DVI_20.npy"
+  # - "./flist/DAVIS-VI_val_CPNET_20.npy"
 input_size: 512
 gt_ratio: 1
 num_frames: 3
@@ -29,19 +29,21 @@ dinov3_weights: "./runs/dinov3_vitl16/dinov3_vitl16_pretrain_lvd1689m-8aa4cbdd.p
 dinov3_repo: "./dinov3"
 allow_hub_download: false
 
-# Model — Multi-layer DINOv3 Encoder + Progressive Decoder
+# Model — Baseline-Preserving MVP (multi-layer fusion + residual decoder)
 freeze_backbone: true
-selected_layers: [5, 11, 17, 23]
-encoder_dim: 256
-checkpoint: ""
-
-# Optional LoRA fine-tuning for DINOv3 ViT attention layers.
-# Default targets match official DINOv3 block names: blocks.*.attn.qkv/proj.
 use_lora: false
 lora_rank: 4
 lora_alpha: 8.0
 lora_dropout: 0.0
 lora_targets: "attn.qkv,attn.proj"
+
+selected_layers: [17, 23]
+main_layer: 23
+encoder_dim: 256
+max_aux_scale: 1.0
+lambda_residual: 0.2
+lambda_coarse: 0.5
+checkpoint: ""
 
 # Train
 n_epochs: 1000
@@ -56,5 +58,5 @@ threshold: 0.5
 eval_frame_chunk: 5
 
 # Output
-save_dir: "runs/dinov3_vitl16_lora"
-visualization_dir: "runs/dinov3_vitl16_lora/vis"
+save_dir: "runs/dinov3_vitl16_eam_mvp"
+visualization_dir: "runs/dinov3_vitl16_eam_mvp/vis"

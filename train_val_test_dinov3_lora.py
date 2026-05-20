@@ -217,14 +217,18 @@ class DinoMultiLayerPatchEncoder(nn.Module):
         self.register_buffer("image_mean", mean)
         self.register_buffer("image_std", std)
 
-    def forward(self, video: torch.Tensor) -> torch.Tensor:
+    def forward(self, video: torch.Tensor, return_per_layer: bool = False) -> torch.Tensor | tuple[torch.Tensor, dict[int, torch.Tensor], dict[int, torch.Tensor]]:
         """Extract fused multi-layer features.
 
         Args:
             video: [B, T, 3, H, W] RGB in [0, 1]
+            return_per_layer: if True, also return dicts of per-layer projected and raw features
 
         Returns:
             fused_features: [B, T, out_dim, H//16, W//16]
+            (if return_per_layer) also:
+                per_layer_proj: dict layer_idx → [B, T, out_dim, h, w]
+                per_layer_raw:  dict layer_idx → [B, T, 1024, h, w]  (unprojected DINO features)
         """
         B, T, C, H, W = video.shape
         frames = video.reshape(B * T, C, H, W)
@@ -242,8 +246,17 @@ class DinoMultiLayerPatchEncoder(nn.Module):
 
         concat = torch.cat(projected, dim=1)
         fused = self.fusion(concat)
+        fused = fused.reshape(B, T, *fused.shape[1:])
 
-        return fused.reshape(B, T, *fused.shape[1:])
+        if return_per_layer:
+            per_layer_proj = {}
+            per_layer_raw = {}
+            for layer_idx, p, r in zip(self.selected_layers, projected, layer_outputs):
+                per_layer_proj[layer_idx] = p.reshape(B, T, *p.shape[1:])
+                per_layer_raw[layer_idx] = r.reshape(B, T, *r.shape[1:])
+            return fused, per_layer_proj, per_layer_raw
+
+        return fused
 
 
 # ── High-frequency Boundary Branch ────────────────────────────────────────
@@ -346,6 +359,329 @@ class ProgressiveDecoder(nn.Module):
         mask_logits = self.head_pred(x)  # [B, 1, H, W]
 
         return mask_logits
+
+
+# ── Original Coarse Mask Head (baseline decoder) ──────────────────────────
+
+class CoarseMaskHead(nn.Module):
+    """Original simple decoder: BN+ReLU convolutions at H/16.
+
+    Matches the verified strong baseline:
+        Conv2d(1024→256) + BN + ReLU
+        Conv2d(256→128)  + BN + ReLU
+        Conv2d(128→1)
+    """
+    def __init__(self):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(DINOV3_FEATURE_DIM, 256, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(256),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(256, 128, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(128, 1, kernel_size=1),
+        )
+
+    def forward(self, f_last: torch.Tensor, out_size: tuple[int, int]) -> tuple[torch.Tensor, torch.Tensor]:
+        """Forward pass.
+
+        Args:
+            f_last: [BT, 1024, h, w] last-layer DINOv3 feature
+            out_size: (H, W) target size for upsampled logits
+
+        Returns:
+            coarse_logits: [BT, 1, h, w]
+            coarse_logits_up: [BT, 1, H, W]
+        """
+        coarse_logits = self.net(f_last)
+        coarse_logits_up = F.interpolate(coarse_logits, size=out_size, mode="bilinear", align_corners=False)
+        return coarse_logits, coarse_logits_up
+
+
+# ── Gated Residual Fusion ─────────────────────────────────────────────────
+
+class GatedResidualFusion(nn.Module):
+    """Gated fusion of multi-layer DINOv3 features.
+
+    Main layer feature is the primary source; auxiliary layers contribute
+    via learnable gates: gate = sigmoid(alpha) * max_aux_scale, initialized
+    near zero so training starts close to using only the main layer.
+
+    Args:
+        selected_layers: all extracted layer indices (e.g. [17, 23])
+        main_layer: index of the primary layer (e.g. 23)
+        encoder_dim: projected channel dimension (default 256)
+        max_aux_scale: maximum gate value for auxiliary layers (default 0.1)
+        init_alpha: initial alpha value, sigmoid(init_alpha) ≈ 0 (default -6.0)
+    """
+    def __init__(
+        self,
+        selected_layers: list[int],
+        main_layer: int = 23,
+        encoder_dim: int = 256,
+        max_aux_scale: float = 0.1,
+        init_alpha: float = -6.0,
+    ):
+        super().__init__()
+        self.selected_layers = selected_layers
+        self.main_layer = main_layer
+        self.aux_layers = [l for l in selected_layers if l != main_layer]
+        self.max_aux_scale = max_aux_scale
+
+        # Shared projector for all layers
+        self.projectors = nn.ModuleDict()
+        for layer in selected_layers:
+            self.projectors[str(layer)] = nn.Sequential(
+                LayerNormChannel(DINOV3_FEATURE_DIM),
+                nn.Conv2d(DINOV3_FEATURE_DIM, encoder_dim, kernel_size=1, bias=False),
+            )
+
+        # Learnable gates for auxiliary layers
+        self.gate_alphas = nn.ParameterDict()
+        for layer in self.aux_layers:
+            self.gate_alphas[str(layer)] = nn.Parameter(torch.tensor(init_alpha))
+
+    def forward(self, per_layer_features: dict[int, torch.Tensor]) -> torch.Tensor:
+        """Fuse features with gated residual.
+
+        Args:
+            per_layer_features: dict mapping layer_idx → [BT, 1024, h, w] raw DINO features
+
+        Returns:
+            fused_feat: [BT, encoder_dim, h, w]
+        """
+        main_feat = self.projectors[str(self.main_layer)](per_layer_features[self.main_layer])
+        fused = main_feat
+
+        for aux_layer in self.aux_layers:
+            aux_feat = self.projectors[str(aux_layer)](per_layer_features[aux_layer])
+            gate = torch.sigmoid(self.gate_alphas[str(aux_layer)]) * self.max_aux_scale
+            fused = fused + gate * aux_feat
+
+        return fused
+
+
+# ── Residual Progressive Decoder ──────────────────────────────────────────
+
+class ResidualProgressiveDecoder(nn.Module):
+    """Lightweight progressive upsampling decoder that outputs residual logits.
+
+    Does NOT output the final mask. Outputs a residual that is added to the
+    coarse_logits_up with a small lambda weight.
+
+    Args:
+        encoder_dim: channel dimension of fused feature (default 256)
+        channels: channel progression for upsampling stages (default [128,96,64,32,16])
+        num_groups: GroupNorm groups
+    """
+    def __init__(
+        self,
+        encoder_dim: int = 256,
+        channels: list[int] | None = None,
+        num_groups: int = 16,
+    ):
+        super().__init__()
+        ch = channels or [128, 96, 64, 32, 16]
+        c1, c2, c3, c4, c5 = ch
+
+        # 1/16: concat(fused_feat + coarse_logits) → c1
+        self.fuse_16 = nn.Sequential(
+            nn.Conv2d(encoder_dim + 1, c1, kernel_size=1, bias=False),
+            nn.GroupNorm(min(num_groups, c1), c1),
+            nn.GELU(),
+        )
+
+        # 1/16 → 1/8: c1 → c2
+        self.up_8 = nn.Sequential(
+            nn.Conv2d(c1, c2, kernel_size=3, padding=1, bias=False),
+            nn.GroupNorm(min(num_groups, c2), c2),
+            nn.GELU(),
+        )
+
+        # 1/8 → 1/4: c2 → c3
+        self.up_4 = nn.Sequential(
+            nn.Conv2d(c2, c3, kernel_size=3, padding=1, bias=False),
+            nn.GroupNorm(min(num_groups, c3), c3),
+            nn.GELU(),
+        )
+
+        # 1/4 → 1/2: c3 → c4
+        self.up_2 = nn.Sequential(
+            nn.Conv2d(c3, c4, kernel_size=3, padding=1, bias=False),
+            nn.GroupNorm(min(num_groups, c4), c4),
+            nn.GELU(),
+        )
+
+        # 1/2 → Full: c4 → c5 → 1
+        self.up_full = nn.Sequential(
+            nn.Conv2d(c4, c5, kernel_size=3, padding=1, bias=False),
+            nn.GroupNorm(min(num_groups, c5), c5),
+            nn.GELU(),
+            nn.Conv2d(c5, 1, kernel_size=1),
+        )
+
+    def forward(
+        self,
+        fused_feat_bt: torch.Tensor,
+        coarse_logits_bt: torch.Tensor,
+    ) -> torch.Tensor:
+        """Decode residual logits.
+
+        Args:
+            fused_feat_bt: [BT, encoder_dim, h, w]
+            coarse_logits_bt: [BT, 1, h, w]
+
+        Returns:
+            residual_logits: [BT, 1, H, W]
+        """
+        # 1/16
+        x = torch.cat([fused_feat_bt, coarse_logits_bt], dim=1)
+        x = self.fuse_16(x)  # [BT, c1, h, w]
+
+        # 1/16 → 1/8
+        x = F.interpolate(x, scale_factor=2, mode="bilinear", align_corners=False)
+        x = self.up_8(x)  # [BT, c2, H/8, W/8]
+
+        # 1/8 → 1/4
+        x = F.interpolate(x, scale_factor=2, mode="bilinear", align_corners=False)
+        x = self.up_4(x)  # [BT, c3, H/4, W/4]
+
+        # 1/4 → 1/2
+        x = F.interpolate(x, scale_factor=2, mode="bilinear", align_corners=False)
+        x = self.up_2(x)  # [BT, c4, H/2, W/2]
+
+        # 1/2 → Full
+        x = F.interpolate(x, scale_factor=2, mode="bilinear", align_corners=False)
+        x = self.up_full(x)  # [BT, 1, H, W]
+
+        return x
+
+
+# ── Baseline-Preserving MVP Model ─────────────────────────────────────────
+
+class DINOv3EAMBaselinePreservingMVP(nn.Module):
+    """DINOv3 ViT-L/16 EAM MVP with baseline-preserving design.
+
+    Core principle:
+        final_logits = coarse_logits_up + lambda_residual * residual_logits
+
+    The original coarse mask head is always the primary prediction source.
+    Multi-layer fusion and progressive decoder only add gated residuals.
+
+    Input:
+        clip: [B, T, 3, H, W], RGB in [0, 1]
+
+    Output dict:
+        mask_logits: [B, T, 1, H, W]  ← final prediction
+        coarse_logits: [B, T, 1, h, w]
+        coarse_logits_up: [B, T, 1, H, W]
+        residual_logits: [B, T, 1, H, W]
+        fused_feat: [B, T, encoder_dim, h, w]
+    """
+
+    def __init__(
+        self,
+        backbone: nn.Module,
+        selected_layers: list[int] | None = None,
+        main_layer: int = 23,
+        encoder_dim: int = 256,
+        freeze_backbone: bool = True,
+        use_lora: bool = False,
+        lora_rank: int = 4,
+        lora_alpha: float = 8.0,
+        lora_dropout: float = 0.0,
+        lora_targets: tuple[str, ...] = DEFAULT_LORA_TARGETS,
+        max_aux_scale: float = 0.1,
+        lambda_residual: float = 0.1,
+    ):
+        super().__init__()
+        self.backbone = backbone
+        self.freeze_backbone = freeze_backbone
+        self.use_lora = use_lora
+        self.lambda_residual = lambda_residual
+
+        # LoRA injection
+        self.lora_layers = 0
+        if use_lora:
+            if lora_rank <= 0:
+                raise ValueError("lora_rank must be > 0 when use_lora is enabled")
+            self.backbone, self.lora_layers = add_peft_lora_to_backbone(
+                backbone=self.backbone,
+                target_suffixes=lora_targets,
+                rank=lora_rank,
+                alpha=lora_alpha,
+                dropout=lora_dropout,
+            )
+            if self.lora_layers == 0:
+                raise RuntimeError(f"No DINOv3 Linear layers matched LoRA targets: {lora_targets}")
+
+        if freeze_backbone:
+            for param in self.backbone.parameters():
+                param.requires_grad = False
+
+        # Feature encoder (also handles ImageNet normalization)
+        self.encoder = DinoMultiLayerPatchEncoder(
+            backbone=self.backbone,
+            selected_layers=selected_layers or [17, 23],
+            out_dim=encoder_dim,
+            freeze_backbone=freeze_backbone,
+            use_lora=use_lora,
+        )
+
+        # Original coarse mask head (baseline)
+        self.coarse_head = CoarseMaskHead()
+
+        # Gated residual fusion
+        self.gated_fusion = GatedResidualFusion(
+            selected_layers=selected_layers or [17, 23],
+            main_layer=main_layer,
+            encoder_dim=encoder_dim,
+            max_aux_scale=max_aux_scale,
+        )
+
+        # Residual progressive decoder
+        self.residual_decoder = ResidualProgressiveDecoder(
+            encoder_dim=encoder_dim,
+        )
+
+        # Buffer for main layer index (for per-layer feature lookup)
+        self.register_buffer("_main_layer", torch.tensor(main_layer, dtype=torch.long))
+
+    def forward(self, clip: torch.Tensor) -> dict[str, torch.Tensor]:
+        B, T, C, H, W = clip.shape
+        h, w = H // 16, W // 16
+
+        # 1. Extract features
+        fused_feat, per_layer_proj, per_layer_raw = self.encoder(clip, return_per_layer=True)
+        # fused_feat:      [B, T, encoder_dim, h, w]  fused multi-layer feature
+        # per_layer_proj:  dict layer_idx → [B, T, encoder_dim, h, w]  projected
+        # per_layer_raw:   dict layer_idx → [B, T, 1024, h, w]  raw DINO features
+
+        main_layer_idx = int(self._main_layer.item())
+
+        # 2. Coarse mask head (on last layer raw 1024ch feature)
+        f_last_raw = per_layer_raw[main_layer_idx]  # [B, T, 1024, h, w]
+        f_last_bt = f_last_raw.reshape(B * T, DINOV3_FEATURE_DIM, h, w)
+        coarse_logits, coarse_logits_up = self.coarse_head(f_last_bt, (H, W))
+
+        # 3. Gated residual fusion (uses raw features, projects internally)
+        per_layer_raw_bt = {k: v.reshape(B * T, DINOV3_FEATURE_DIM, h, w) for k, v in per_layer_raw.items()}
+        fused_feat_bt = self.gated_fusion(per_layer_raw_bt)  # [BT, encoder_dim, h, w]
+
+        # 4. Residual progressive decoder
+        residual_logits = self.residual_decoder(fused_feat_bt, coarse_logits)
+
+        # 5. Baseline-preserving final output
+        final_logits_bt = coarse_logits_up + self.lambda_residual * residual_logits
+
+        return {
+            "mask_logits": final_logits_bt.reshape(B, T, 1, H, W),
+            "coarse_logits": coarse_logits.reshape(B, T, 1, h, w),
+            "coarse_logits_up": coarse_logits_up.reshape(B, T, 1, H, W),
+            "residual_logits": residual_logits.reshape(B, T, 1, H, W),
+            "fused_feat": fused_feat,
+        }
 
 
 class DINOv3ViTL16InpaintingDetector(nn.Module):
@@ -490,20 +826,23 @@ def validate_config(cfg: dict[str, Any], mode: str) -> None:
               f"fallback to cuda:0 or CUDA_VISIBLE_DEVICES")
 
 
-def build_model(cfg: dict[str, Any], device: torch.device, base_dir: Path) -> DINOv3ViTL16InpaintingDetector:
+def build_model(cfg: dict[str, Any], device: torch.device, base_dir: Path) -> DINOv3EAMBaselinePreservingMVP:
     backbone = load_dinov3_backbone(cfg, base_dir)
     lora_targets = tuple(str(item).strip() for item in str(cfg.get("lora_targets", "attn.qkv,attn.proj")).split(",") if str(item).strip())
-    model = DINOv3ViTL16InpaintingDetector(
+    selected = [int(x) for x in cfg.get("selected_layers", [17, 23])]
+    model = DINOv3EAMBaselinePreservingMVP(
         backbone=backbone,
-        selected_layers=[int(x) for x in cfg.get("selected_layers", [5, 11, 17, 23])],
+        selected_layers=selected,
+        main_layer=int(cfg.get("main_layer", 23)),
         encoder_dim=int(cfg.get("encoder_dim", 256)),
-        decoder_channels=int(cfg.get("decoder_channels", 256)),
         freeze_backbone=bool(cfg.get("freeze_backbone", True)),
         use_lora=bool(cfg.get("use_lora", False)),
         lora_rank=int(cfg.get("lora_rank", 4)),
         lora_alpha=float(cfg.get("lora_alpha", 8.0)),
         lora_dropout=float(cfg.get("lora_dropout", 0.0)),
         lora_targets=lora_targets,
+        max_aux_scale=float(cfg.get("max_aux_scale", 0.1)),
+        lambda_residual=float(cfg.get("lambda_residual", 0.1)),
     )
 
     checkpoint = cfg.get("checkpoint", "")
@@ -513,9 +852,8 @@ def build_model(cfg: dict[str, Any], device: torch.device, base_dir: Path) -> DI
         print(f"[checkpoint] loaded: {checkpoint}")
 
     total, trainable = count_parameters(model)
-    selected = cfg.get("selected_layers", [5, 11, 17, 23])
-    print(f"[model] DINOv3 ViT-L/16 multi-layer encoder, layers={list(selected)}, "
-          f"LoRA layers: {model.lora_layers}")
+    print(f"[model] DINOv3 EAM baseline-preserving MVP, layers={list(selected)}, "
+          f"main_layer={int(cfg.get('main_layer', 23))}, LoRA layers: {model.lora_layers}")
     print(f"[params] total {total:,} trainable {trainable:,}")
     return model.to(device)
 
@@ -527,6 +865,7 @@ LOG_FIELDS = [
     "train_bce_loss",
     "train_focal_loss",
     "train_iou_loss",
+    "train_coarse_loss",
     "train_iou",
     "train_f1",
     "train_precision",
@@ -588,14 +927,24 @@ def append_epoch_log(
         f.write(",".join(format_log_value(row_values.get(field)) for field in LOG_FIELDS) + "\n")
 
 
-def forward_in_frame_chunks(model: nn.Module, frames: torch.Tensor, frame_chunk: int) -> torch.Tensor:
+def forward_in_frame_chunks(model: nn.Module, frames: torch.Tensor, frame_chunk: int) -> torch.Tensor | dict[str, torch.Tensor]:
     if frame_chunk <= 0 or frames.shape[1] <= frame_chunk:
         return model(frames)
 
+    # Test run first chunk to see if output is dict or tensor
+    first_out = model(frames[:, :1])
+    is_dict = isinstance(first_out, dict)
+
     outputs = []
     for start in range(0, frames.shape[1], frame_chunk):
-        outputs.append(model(frames[:, start : start + frame_chunk]))
-    return torch.cat(outputs, dim=1)
+        out = model(frames[:, start : start + frame_chunk])
+        outputs.append(out["mask_logits"] if is_dict else out)
+
+    cat = torch.cat(outputs, dim=1)
+    if is_dict:
+        first_out["mask_logits"] = cat
+        return first_out
+    return cat
 
 
 def run_epoch(
@@ -611,14 +960,16 @@ def run_epoch(
     visualization_dir: Path | None = None,
     grad_accum_steps: int = 1,
     eval_frame_chunk: int = 0,
+    lambda_coarse: float = 0.0,
 ) -> dict[str, float]:
     is_train = mode == "train"
     model.train(is_train)
 
-    meters = {
-        key: AverageMeter()
-        for key in ["loss", "bce_loss", "focal_loss", "iou_loss", "iou", "f1", "precision", "recall", "accuracy"]
-    }
+    meter_keys = ["loss", "bce_loss", "focal_loss", "iou_loss", "iou", "f1", "precision", "recall", "accuracy"]
+    if lambda_coarse > 0:
+        meter_keys.extend(["coarse_loss", "coarse_bce_loss", "coarse_focal_loss", "coarse_iou_loss"])
+
+    meters = {key: AverageMeter() for key in meter_keys}
 
     if is_train:
         if optimizer is None:
@@ -631,9 +982,31 @@ def run_epoch(
 
         with torch.set_grad_enabled(is_train):
             with torch.cuda.amp.autocast(enabled=amp and device.type == "cuda"):
-                logits_all = model(frames) if is_train else forward_in_frame_chunks(model, frames, eval_frame_chunk)
+                raw_out = model(frames) if is_train else forward_in_frame_chunks(model, frames, eval_frame_chunk)
+                # Handle dict output (new model) vs tensor output (legacy)
+                if isinstance(raw_out, dict):
+                    logits_all = raw_out["mask_logits"]
+                else:
+                    logits_all = raw_out
+
                 logits, loss_masks = align_logits_and_masks(logits_all, masks)
                 loss, loss_items = criterion(logits, loss_masks)
+
+                # Coarse loss at H/16 resolution
+                if is_train and lambda_coarse > 0 and isinstance(raw_out, dict):
+                    coarse_bt = raw_out["coarse_logits"]  # [B, T, 1, h, w]
+                    h_c, w_c = coarse_bt.shape[-2:]
+                    if masks.ndim == 5:
+                        c_flat = coarse_bt.reshape(batch_size * masks.shape[1], 1, h_c, w_c)
+                        m_flat = masks.reshape(batch_size * masks.shape[1], 1, masks.shape[-2], masks.shape[-1])
+                    else:
+                        c_flat = coarse_bt[:, coarse_bt.shape[1] // 2]
+                        m_flat = masks
+                    target_low = F.interpolate(m_flat.float(), size=(h_c, w_c), mode="nearest")
+                    coarse_loss, coarse_items = criterion(c_flat, target_low)
+                    loss = loss + lambda_coarse * coarse_loss
+                    for k, v in coarse_items.items():
+                        loss_items[f"coarse_{k}"] = v
 
             if is_train:
                 scaled_loss = loss / grad_accum_steps
@@ -652,7 +1025,8 @@ def run_epoch(
 
         metric_items = binary_metrics_from_logits(logits.detach(), loss_masks.detach(), threshold=threshold)
         for key, value in {**loss_items, **metric_items}.items():
-            meters[key].update(value, batch_size)
+            if key in meters:
+                meters[key].update(value, batch_size)
 
         if visualization_dir is not None and not is_train and step <= 50:
             names = batch[4] if len(batch) > 4 else []
@@ -708,6 +1082,7 @@ def train(cfg: dict[str, Any], device: torch.device, base_dir: Path) -> None:
             amp=bool(cfg.get("amp", True)),
             threshold=float(cfg.get("threshold", 0.5)),
             grad_accum_steps=int(cfg.get("grad_accum_steps", 1)),
+            lambda_coarse=float(cfg.get("lambda_coarse", 0.5)),
         )
         print(
             f"[epoch {epoch}] train loss {train_metrics['loss']:.4f} "
@@ -786,9 +1161,12 @@ def main() -> None:
     parser.add_argument("--n_epochs", type=int, default=None)
     parser.add_argument("--learning_rate", type=float, default=None)
     parser.add_argument("--weight_decay", type=float, default=None)
-    parser.add_argument("--decoder_channels", type=int, default=None)
     parser.add_argument("--selected_layers", type=int, nargs="*", default=None)
+    parser.add_argument("--main_layer", type=int, default=None)
     parser.add_argument("--encoder_dim", type=int, default=None)
+    parser.add_argument("--max_aux_scale", type=float, default=None)
+    parser.add_argument("--lambda_residual", type=float, default=None)
+    parser.add_argument("--lambda_coarse", type=float, default=None)
     parser.add_argument("--freeze_backbone", type=str2bool, default=None)
     parser.add_argument("--use_lora", type=str2bool, default=None)
     parser.add_argument("--lora_rank", type=int, default=None)
@@ -815,11 +1193,14 @@ def main() -> None:
         "lora_alpha": 8.0,
         "lora_dropout": 0.0,
         "lora_targets": ",".join(DEFAULT_LORA_TARGETS),
-        "decoder_channels": 256,
-        "selected_layers": [5, 11, 17, 23],
+        "selected_layers": [17, 23],
+        "main_layer": 23,
         "encoder_dim": 256,
-        "save_dir": "runs/dinov3_vitl16",
-        "visualization_dir": "runs/dinov3_vitl16/vis",
+        "max_aux_scale": 1.0,
+        "lambda_residual": 0.2,
+        "lambda_coarse": 0.5,
+        "save_dir": "runs/dinov3_vitl16_eam_mvp",
+        "visualization_dir": "runs/dinov3_vitl16_eam_mvp/vis",
         "checkpoint": "",
         "grad_accum_steps": 1,
         "eval_frame_chunk": 1,
@@ -856,9 +1237,11 @@ def main() -> None:
     print(f"[device] {device} (gpu_id={gpu_id})")
     print(f"[mode] {mode}")
     print(f"[dinov3] model={DINOV3_MODEL_NAME} weights={cfg['dinov3_weights']}")
-    print(f"[dinov3] encoder: multi-layer, layers={cfg.get('selected_layers', [5, 11, 17, 23])}, "
-          f"encoder_dim={int(cfg.get('encoder_dim', 256))}")
+    print(f"[dinov3] encoder: layers={cfg.get('selected_layers', [17, 23])}, "
+          f"main_layer={int(cfg.get('main_layer', 23))}, encoder_dim={int(cfg.get('encoder_dim', 256))}")
     print(f"[lora] enabled={bool(cfg.get('use_lora', False))} rank={int(cfg.get('lora_rank', 4))}")
+    print(f"[residual] lambda={float(cfg.get('lambda_residual', 0.1))}, "
+          f"coarse_loss_lambda={float(cfg.get('lambda_coarse', 0.5))}")
 
     if mode == "train":
         train(cfg, device, base_dir)

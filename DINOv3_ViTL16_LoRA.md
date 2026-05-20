@@ -195,64 +195,66 @@ input frame | probability map | binary prediction | ground truth
 
 ### 整体前向流程
 
-```text
-clip [B, T, 3, H, W]
-  -> reshape 为逐帧输入 [B*T, 3, H, W]
-  -> ImageNet mean/std 归一化
-  -> DINOv3 ViT-L/16 backbone
-  -> 抽取 4 层 (block 5, 11, 17, 23) patch token 特征
-  -> 每层 LayerNorm + Conv1×1 投影到 256 通道
-  -> Concat 4 层 → Conv1×1 + Conv3×3 融合 → [B*T, 256, H/16, W/16]
-  -> reshape 回 [B, T, 256, H/16, W/16]
-
-高频边界分支 (per-frame):
-  RGB + Laplacian + Sobel magnitude [B*T, 5, H, W]
-  -> 轻量 CNN 逐步下采样
-  -> 输出 1/4 (96ch), 1/8 (128ch), 1/16 (192ch) 多尺度边界特征
-
-频率引导边界解码器 (per-frame):
-  1/16: concat(编码器特征(256) + 粗预测mask(1) + 边界1_16(192))
-        → Conv1×1→GN→GELU→Conv3×3→GN→GELU → [256, H/16, W/16]
-  1/8:  bilinear ×2 + concat(边界1_8) → Conv3×3×2 → [192, H/8, W/8]
-  1/4:  bilinear ×2 + concat(边界1_4) → Conv3×3×2 → [128, H/4, W/4]
-  Full: bilinear ×2 → [64, H/2] → bilinear ×2 → [32, H] → Conv1×1 → [1, H, W]
-  -> mask_logits [B, T, 1, H, W]
-  -> (可选) edge_logits [B, T, 1, H, W] 从 1/4 特征预测
 ```
+clip [B, T, 3, H, W]
+  ↓
+DINOv3 ViT-L/16 backbone (冻结 + 可选 LoRA)
+  → get_intermediate_layers(n=[17, 23], reshape=True)
+  → layer_17, layer_23: [B*T, 1024, H/16, W/16]
+  ↓
+┌─ 主分支 (CoarseMaskHead) ──────────────────────────────┐
+│  layer_23 → Conv3×3 1024→256 → BN → ReLU               │
+│           → Conv3×3 256→128  → BN → ReLU               │
+│           → Conv1×1 128→1    → coarse_logits [BT,1,h,w] │
+│           → bilinear upsample → coarse_logits_up [BT,1,H,W]
+└─────────────────────────────────────────────────────────┘
+  ↓
+┌─ 门控残差融合 (GatedResidualFusion) ────────────────────┐
+│  layer_23 → LayerNorm → Conv1×1 1024→256 → main         │
+│  layer_17 → LayerNorm → Conv1×1 1024→256 → aux           │
+│  fused = main + sigmoid(alpha) * 0.1 * aux              │
+└─────────────────────────────────────────────────────────┘
+  ↓
+┌─ 残差渐进解码器 (ResidualProgressiveDecoder) ───────────┐
+│  concat(fused(256) + coarse_logits(1))                  │
+│  → Conv1×1 257→128 → GN → GELU                         │
+│  → bilinear×2 → Conv3×3 128→96  → GN → GELU            │
+│  → bilinear×2 → Conv3×3 96→64   → GN → GELU            │
+│  → bilinear×2 → Conv3×3 64→32   → GN → GELU            │
+│  → bilinear×2 → Conv3×3 32→16 → GN → GELU → Conv1×1→1 │
+│  → residual_logits [BT, 1, H, W]                        │
+└─────────────────────────────────────────────────────────┘
+  ↓
+final_logits = coarse_logits_up + λ * residual_logits
+  ↓
+output [B, T, 1, H, W]  (λ = 0.2, 可由 coarse_logits_up 退化)
+```
+
+### 核心设计原则
+
+```text
+final_logits = coarse_logits_up + lambda_residual * residual_logits
+```
+
+- **主分支**：原始强 baseline（DINOv3 last-layer + BN+ReLU coarse head），始终是预测主源
+- **门控残差融合**：辅助层(layer 17)通过可学习的 sigmoid gate 初始接近 0，不破坏 baseline
+- **残差解码器**：只输出 residual，不直接输出最终 mask
+- **Coarse Loss**：在 H/16 分辨率额外监督 coarse_logits，稳定训练
 
 ### 多层特征提取
 
-脚本通过 DINOv3 官方接口取 4 层特征：
+脚本通过 DINOv3 官方接口取指定层特征（默认从 layer 17 和 23）：
 
 ```python
 layer_outputs = backbone.get_intermediate_layers(
     frames,
-    n=[5, 11, 17, 23],  # 4 层，0-indexed，对应 ViT-L/24 的 L/4, L/2, 3L/4, L-1
+    n=[17, 23],  # 默认 2 层，0-indexed
     reshape=True,
     norm=True,
 )
-# layer_outputs 是 list，每个元素形状为 [B*T, 1024, H/16, W/16]
 ```
 
-每层特征通过 LayerNorm + Conv1×1(1024→256) 投影到统一通道，Concat 后经 Conv1×1(4C→2C) → GN → GELU → Conv3×3(2C→C) → GN → GELU 融合为 `[B*T, 256, H/16, W/16]`。
-
-输出 reshape 回视频维度：`[B, T, 256, H/16, W/16]`。
-
-### 高频边界分支
-
-对每帧 RGB 计算边界 cue（5 通道）：RGB + Laplacian + Sobel magnitude。
-
-```python
-cues = compute_boundary_cues(frames)  # [B*T, 5, H, W]
-```
-
-轻量 CNN 逐步下采样，用 GroupNorm + GELU + 残差块，输出三个尺度的边界特征：
-
-| 尺度 | 通道 | 用途 |
-|---|---|---|
-| 1/4 | 96 | 解码器 1/4 融合 |
-| 1/8 | 128 | 解码器 1/8 融合 |
-| 1/16 | 192 | 解码器 1/16 融合 |
+最后一层（layer 23 / block 24）单独送入 `CoarseMaskHead` 产生主预测。layer 17 通过门控残差融合辅助。
 
 ### LoRA 注入位置
 
@@ -318,99 +320,39 @@ scale = lora_alpha / lora_rank
 训练时可训练参数包括：
 
 ```text
-编码器投影 + 融合参数 + 解码器参数 + 高频边界分支参数 + (可选) LoRA 参数
+CoarseMaskHead + 门控融合投影 + 残差解码器 + (可选) LoRA 参数
 ```
 
-不开 LoRA 时，可训练参数包括：
+不开 LoRA 时，可训练参数约 0.5M～1M，具体取决于 selected_layers 数量。
 
-```text
-- 4× LayerNorm + Conv1×1 投影
-- 融合 Conv1×1 + Conv3×3
-- 高频边界分支 (Stem + 3 stages)
-- 频率引导解码器 (coarse_head + fuse_16/8/4 + head + edge_head)
-```
+### 关键模块说明
 
-### 频率引导边界解码器
+**CoarseMaskHead**：保留原始 baseline 的 BN+ReLU 简单 decoder，直接输入 DINOv3 最后一层 1024 维 raw feature。
 
-解码器是 `FrequencyGuidedBoundaryDecoder`，从编码器融合特征出发，结合多尺度边界特征渐进上采样。
+**GatedResidualFusion**：对每层做 LayerNorm + Conv1×1(1024→256)。aux 层通过 sigmoid 门控缩放后加到主层上。门控初始化为 `sigmoid(-6) ≈ 0.0025`，训练初期几乎等价于只用主层。
 
-不再使用 BatchNorm + ReLU，改用 GroupNorm + GELU 适配小 batch 训练。
-
-默认 `encoder_dim=256` 时，通道变化如下：
-
-**1/16 → 1/8：**
-
-```text
-concat(编码器特征(256) + 粗预测mask(1) + 边界1_16(192))
-  -> [B, 449, H/16, W/16]
-  -> Conv1×1 449→256 → GN → GELU → Conv3×3 256→256 → GN → GELU
-  -> [B, 256, H/16, W/16] → bilinear ×2
-  -> concat(边界1_8(128)) → [B, 384, H/8, W/8]
-  -> Conv3×3 384→192 → GN → GELU → Conv3×3 192→192 → GN → GELU
-  -> [B, 192, H/8, W/8]
-```
-
-**1/8 → 1/4：**
-
-```text
-bilinear ×2 → concat(边界1_4(96)) → [B, 288, H/4, W/4]
-  -> Conv3×3 288→128 → GN → GELU → Conv3×3 128→128 → GN → GELU
-  -> [B, 128, H/4, W/4]
-```
-
-**1/4 → Full：**
-
-```text
-bilinear ×2 → [B, 128, H/2, W/2]
-  -> Conv3×3 128→64 → GN → GELU → [B, 64, H/2, W/2]
-  -> bilinear ×2 → [B, 64, H, W]
-  -> Conv3×3 64→32 → GN → GELU → [B, 32, H, W]
-  -> Conv1×1 32→1 → [B, 1, H, W] (mask_logits)
-```
-
-**可选 Edge Head (use_edge_head: true)：**
-
-```text
-从 1/4 特征 [B, 128, H/4, W/4]
-  -> Conv3×3 128→64 → GELU → Conv1×1 64→1
-  -> bilinear up to H×W
-  -> [B, 1, H, W] (edge_logits)
-```
-
-decoder 输出的是未经过 sigmoid 的 logits。训练时直接送入当前项目的 `SegmentationLoss`，推理或可视化时再通过 sigmoid 得到概率图。
+**ResidualProgressiveDecoder**：轻量渐进上采样，使用 GroupNorm + GELU。只输出 residual logits，不直接输出最终 mask。
 
 最终输出：
 
 ```text
 mask_logits: [B, T, 1, H, W]
-edge_logits: [B, T, 1, H, W] (可选)
+coarse_logits: [B, T, 1, h, w]  (H/16 分辨率)
+coarse_logits_up: [B, T, 1, H, W]
+residual_logits: [B, T, 1, H, W]
 ```
 
-## Loss
+### Loss 设计
 
-训练使用项目里的 `SegmentationLoss`，定义在 `my_model/losses.py`。总损失是三个部分直接相加：
+训练总损失：
 
 ```text
-loss = focal_loss + bce_loss + iou_loss
+loss = loss_full + lambda_coarse * loss_coarse
 ```
 
-没有额外权重系数。模型输出是未经过 sigmoid 的 `logits`，标签 `target` 是 0/1 mask。
-
-### 输入形状
-
-训练和验证时，如果标签是中心帧 mask，脚本会取中心帧 logits：
-
-```text
-logits: [B, 1, H, W]
-target: [B, 1, H, W]
-```
-
-测试时如果标签包含全视频所有帧，会把时间维展开：
-
-```text
-logits: [B*T, 1, H, W]
-target: [B*T, 1, H, W]
-```
+- **loss_full**：`SegmentationLoss(final_logits, target)` 在 H×W 分辨率（focal + BCE + IoU）
+- **loss_coarse**：`SegmentationLoss(coarse_logits, target_low)` 在 H/16 分辨率，`target_low` 为下采样后的 GT
+- **lambda_coarse**：默认 0.5
 
 ### BCEWithLogitsLoss
 
@@ -499,13 +441,13 @@ class SegmentationLoss(nn.Module):
         }
 ```
 
-训练日志 `log.txt` 里会分别记录 `loss`、`focal_loss`、`bce_loss`、`iou_loss`，方便后续画图分析每个分量的变化。
+训练日志 `log.txt` 里会分别记录 `loss`、`focal_loss`、`bce_loss`、`iou_loss`、`coarse_loss`，方便后续画图分析每个分量的变化。
 
-注意：`input_size` 需要能被 16 整除。多层编码器（4 层 vs 原先 1 层）会增加 backbone 前向计算量，显存需求比单层版本略高。
+注意：`input_size` 需要能被 16 整除。默认只取 2 层 DINOv3 特征（layer 17, 23），backbone 前向计算量较小。
 
 ## 显存建议
 
-DINOv3 ViT-L/16 在 `input_size=512` 时显存占用很高。24GB GPU 上建议从下面的配置开始：
+DINOv3 ViT-L/16 在 `input_size=512` 时显存占用较高。24GB GPU 上建议从下面的配置开始：
 
 ```yaml
 batch_size: 1
@@ -514,9 +456,7 @@ amp: true
 gpu_id: 0
 ```
 
-这表示每次只放 1 个样本进显存，累计 16 次梯度后再更新一次参数，等效 batch 接近 16，但峰值显存接近 batch 1。
-
-**GPU 选择**：如果 GPU 0 被占用（OOM），切换到其他空闲显卡：
+**GPU 选择**：如果 GPU 0 被占用，切换到其他空闲显卡：
 
 ```bash
 python train_val_test_dinov3_lora.py \
@@ -531,30 +471,16 @@ python train_val_test_dinov3_lora.py \
 
 ```text
 1. 保持 batch_size: 1
-2. 减小 input_size，例如 384 或 256，注意必须能被 16 整除
-3. 减少 selected_layers 到 3 层（例如 [5, 11, 17]）或 2 层
-4. 关闭 LoRA，只训练 decoder + encoder 投影/融合
-5. 设置环境变量 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True 减少显存碎片影响
+2. 减小 input_size，例如 384 或 256
+3. 关闭 LoRA
+4. PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 ```
 
-示例：
-
-```bash
-PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
-python train_val_test_dinov3_lora.py \
-  --config configs/dinov3_vitl16_lora.yml \
-  --type train \
-  --batch_size 1 \
-  --grad_accum_steps 16
-```
-
-测试阶段会读取一个视频的所有帧。为了避免一次性把 `[1, T, 3, H, W]` 展开成 `[T, 3, H, W]` 后送入 ViT 导致 OOM，脚本支持按时间维分块前向：
+测试阶段支持按时间维分块前向：
 
 ```yaml
 eval_frame_chunk: 1
 ```
-
-`eval_frame_chunk: 1` 表示测试/验证时每次只前向 1 帧，最后把所有分块输出拼回完整视频，再计算全视频所有帧的平均指标。显存足够时可以改成 2、4 或更大来提速。
 
 命令行覆盖：
 
@@ -562,6 +488,6 @@ eval_frame_chunk: 1
 python train_val_test_dinov3_lora.py \
   --config configs/dinov3_vitl16_lora.yml \
   --type test \
-  --checkpoint runs/dinov3_vitl16/best_iou.pt \
+  --checkpoint runs/dinov3_vitl16_eam_mvp/best_iou.pt \
   --eval_frame_chunk 1
 ```
