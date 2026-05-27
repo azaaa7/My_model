@@ -93,6 +93,71 @@ def _sample_indices(
     raise ValueError(f"Unknown mode: {mode}")
 
 
+def _sample_multi_clip_indices(
+    video_length: int,
+    mode: str,
+    num_clips: int = 4,
+    num_frames: int = 4,
+    stride: int = 1,
+) -> list[list[int]]:
+    """Sample ``num_clips`` clips from a video, each of ``num_frames`` frames.
+
+    Train: randomly sample non-overlapping starting positions, sorted chronologically.
+           If the video is too short, pad by repeating the last frame.
+    Val/Test: sequential sliding windows.
+
+    Returns:
+        List of clip index lists, e.g. [[0,1,2,3], [5,6,7,8], ...].
+    """
+    clip_len = num_frames * stride
+    max_start = video_length - clip_len
+
+    if mode == "train":
+        if max_start < 0:
+            # Video too short — pad with last frame repeats
+            clips: list[list[int]] = []
+            for _ in range(num_clips):
+                clip: list[int] = []
+                for i in range(num_frames):
+                    clip.append(min(i * stride, video_length - 1))
+                clips.append(clip)
+            return clips
+
+        starts = random.sample(
+            range(0, max_start + 1),
+            k=min(num_clips, max_start + 1),
+        )
+        starts = sorted(starts)
+
+        # If fewer than num_clips possible starts, pad by repeating
+        while len(starts) < num_clips:
+            starts.append(random.randint(0, max_start))
+        starts = sorted(starts)
+
+        clips = []
+        for s in starts:
+            clip = [min(s + i * stride, video_length - 1) for i in range(num_frames)]
+            clips.append(clip)
+        return clips
+
+    # Val / Test: sequential windows
+    step = num_frames  # non-overlapping by default
+    clips = []
+    for start in range(0, video_length, step):
+        clip = [min(start + i * stride, video_length - 1) for i in range(num_frames)]
+        clips.append(clip)
+
+    # Ensure exactly num_clips clips (pad with last clip if needed)
+    if len(clips) > num_clips:
+        # Evenly subsample
+        indices = [round(i * (len(clips) - 1) / (num_clips - 1)) for i in range(num_clips)] if num_clips > 1 else [0]
+        clips = [clips[i] for i in indices]
+    elif len(clips) < num_clips:
+        while len(clips) < num_clips:
+            clips.append(clips[-1])  # repeat last clip
+    return clips
+
+
 def _validate_num_frames(num_frames: int) -> None:
     if isinstance(num_frames, bool) or not isinstance(num_frames, int):
         raise TypeError(f"num_frames must be an int, got {type(num_frames).__name__}")
@@ -148,6 +213,8 @@ class VideoInpaintingDataset(Dataset):
         augment_prob: float = 0.75,
         robust_noise_snr: int = 0,
         robust_jpeg_quality: int = 0,
+        num_clips: int = 1,
+        clip_stride: int = 1,
     ):
         _validate_num_frames(num_frames)
 
@@ -161,6 +228,8 @@ class VideoInpaintingDataset(Dataset):
         self.augment_prob = augment_prob
         self.robust_noise_snr = robust_noise_snr
         self.robust_jpeg_quality = robust_jpeg_quality
+        self.num_clips = num_clips
+        self.clip_stride = clip_stride
 
         self.to_tensor = transforms.Compose([
             np.float32,
@@ -184,8 +253,16 @@ class VideoInpaintingDataset(Dataset):
             )
 
         video_length = len(frame_list)
-        indices = _sample_indices(video_length, self.mode, self.num_frames, self.val_num_frames)
         name = _derive_sample_name(video_dir)
+
+        # ── Multi-clip mode ───────────────────────────────────────────
+        if self.num_clips > 1:
+            return self._get_multi_clip(
+                video_dir, mask_dir, frame_list, mask_list, video_length, name,
+            )
+
+        # ── Single-clip mode (original behaviour) ─────────────────────
+        indices = _sample_indices(video_length, self.mode, self.num_frames, self.val_num_frames)
 
         frames: List[np.ndarray] = []
         masks: List[np.ndarray] = []
@@ -245,6 +322,92 @@ class VideoInpaintingDataset(Dataset):
             return frames_out, masks_out[self.num_frames // 2], original_h, original_w, name
         return frames_out, masks_out, original_h, original_w, name
 
+    # ------------------------------------------------------------------
+    # Multi-clip sampling
+    # ------------------------------------------------------------------
+
+    def _get_multi_clip(
+        self,
+        video_dir: str,
+        mask_dir: str,
+        frame_list: list[str],
+        mask_list: list[str],
+        video_length: int,
+        name: str,
+    ):
+        """Sample ``num_clips`` clips from the same video, chronologically ordered."""
+        all_clip_indices = _sample_multi_clip_indices(
+            video_length,
+            self.mode,
+            num_clips=self.num_clips,
+            num_frames=self.num_frames,
+            stride=self.clip_stride,
+        )
+
+        all_frames: list[torch.Tensor] = []   # each: [T, 3, H, W]
+        all_masks: list[torch.Tensor] = []    # each: [T, 1, H, W]
+        original_h, original_w = None, None
+
+        for clip_indices in all_clip_indices:
+            frames: list[np.ndarray] = []
+            masks: list[np.ndarray] = []
+
+            for frame_idx in clip_indices:
+                frame_path = str(Path(video_dir) / frame_list[frame_idx])
+                mask_path = str(Path(mask_dir) / mask_list[frame_idx])
+
+                frame = _read_image(frame_path)
+                mask = _read_image(mask_path)
+                mask = _align_mask_to_frame(mask, frame)
+                mask = threshold_mask(mask)
+
+                if original_h is None:
+                    original_h, original_w = frame.shape[:2]
+
+                frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+                masks.append(mask)
+
+            # Augmentation (apply same replay to all frames in the clip)
+            if self.mode == "train" and random.random() < self.augment_prob:
+                aug = self.replay_aug(image=frames[0], mask=masks[0])
+                replay = aug["replay"]
+                frames[0], masks[0] = aug["image"], aug["mask"]
+                for i, (img, mask) in enumerate(zip(frames[1:], masks[1:])):
+                    aug = A.ReplayCompose.replay(replay, image=img, mask=mask)
+                    frames[i + 1], masks[i + 1] = aug["image"], aug["mask"]
+
+            # Robustness perturbations (test only)
+            if self.mode == "test" and self.robust_noise_snr > 0:
+                frames = [add_gaussian_noise_snr(img, self.robust_noise_snr) for img in frames]
+            if self.mode == "test" and 1 <= self.robust_jpeg_quality <= 100:
+                frames = [simulate_jpeg_compression_cv2(img, self.robust_jpeg_quality) for img in frames]
+
+            # Resize & convert to tensor
+            frame_tensors = []
+            mask_tensors = []
+            for img, mask in zip(frames, masks):
+                img = cv2.resize(img, (self.input_size, self.input_size))
+                if self.mode == "train":
+                    mask = cv2.resize(mask, (self.input_size // self.gt_ratio, self.input_size // self.gt_ratio))
+                    mask = threshold_mask(mask)
+                img = img.astype(np.float32) / 255.0
+                mask = mask.astype(np.float32) / 255.0
+                frame_tensors.append(self.to_tensor(img).unsqueeze(0))
+                mask_tensors.append(torch.from_numpy(mask[:, :, :1]).float().permute(2, 0, 1).unsqueeze(0))
+
+            all_frames.append(torch.cat(frame_tensors, dim=0))     # [T, 3, H, W]
+            all_masks.append(torch.cat(mask_tensors, dim=0))       # [T, 1, H, W]
+
+        frames_out = torch.stack(all_frames, dim=0)   # [N, T, 3, H, W]
+        masks_out = torch.stack(all_masks, dim=0)     # [N, T, 1, H, W]
+
+        if self.mode == "train":
+            # Return center-frame mask of center clip as single-mask target
+            # (align_logits_and_masks will handle the shape mismatch)
+            center_mask = masks_out[self.num_clips // 2, self.num_frames // 2]
+            return frames_out, center_mask, original_h, original_w, name
+        return frames_out, masks_out, original_h, original_w, name
+
 
 def build_dataloader(
     samples: SampleList,
@@ -254,9 +417,17 @@ def build_dataloader(
     shuffle: bool | None = None,
     pin_memory: bool = True,
     drop_last: bool | None = None,
+    num_clips: int = 1,
+    clip_stride: int = 1,
     **dataset_kwargs,
 ):
-    dataset = VideoInpaintingDataset(samples=samples, mode=mode, **dataset_kwargs)
+    dataset = VideoInpaintingDataset(
+        samples=samples,
+        mode=mode,
+        num_clips=num_clips,
+        clip_stride=clip_stride,
+        **dataset_kwargs,
+    )
     if shuffle is None:
         shuffle = mode == "train"
     if drop_last is None:

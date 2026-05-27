@@ -13,11 +13,10 @@ import torch.nn.functional as F
 from torch.optim import Adam
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, ReduceLROnPlateau, SequentialLR
 
-from my_model import SegmentationLoss
+from my_model import SegmentationLoss, VideoInpaintTFCU
 from my_model.dinov3_dpt_fpn import DPTReassembleNeck, FPNDecoder
 from my_model.metrics import AverageMeter, binary_metrics_from_logits, set_seed
 from train_val_test_convnext_lora import (
-    align_logits_and_masks,
     count_parameters,
     load_config,
     make_loader,
@@ -57,6 +56,56 @@ def resolve_path_or_paths(value: Any, base_dir: Path) -> Any:
 def sample_paths_exist(value: Any) -> bool:
     paths = split_path_list(value)
     return bool(paths) and all(Path(path).exists() for path in paths)
+
+
+def align_logits_and_masks(
+    logits_all: torch.Tensor,
+    masks: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Align logits and masks for loss computation.
+
+    Handles:
+      - [B, T, 1, H, W]  →  center frame  (legacy single-clip)
+      - [B, N, T, 1, H, W]  →  (B*N*T, 1, H, W)  (multi-clip TFCU)
+      - [B, 1, H, W]  mask  →  (B, 1, H, W)  (single-frame target)
+
+    Also upsamples logits to match mask spatial resolution.
+    """
+    if masks.ndim == 5 and masks.shape[1] > 1 and masks.shape[2] == 1:
+        # masks: [B, T, 1, H, W] — legacy val/test format
+        b, t, c, h, w = masks.shape
+        logits = logits_all.reshape(b * t, 1, logits_all.shape[-2], logits_all.shape[-1])
+        masks = masks.reshape(b * t, c, h, w)
+    elif masks.ndim == 5 and masks.shape[1] == 1:
+        # masks: [B, 1, 1, H, W] — center-frame target for multi-clip train
+        b = masks.shape[0]
+        if logits_all.ndim == 6:
+            # logits_all: [B, N, T, 1, H, W], use center frame of center clip
+            logits = logits_all[:, logits_all.shape[1] // 2, logits_all.shape[2] // 2]
+        elif logits_all.ndim == 5:
+            logits = logits_all[:, logits_all.shape[1] // 2]
+        else:
+            logits = logits_all
+        masks = masks[:, 0]
+    elif masks.ndim == 6:
+        # masks: [B, N, T, 1, H, W] — full multi-clip val/test target
+        b, n, t, c, h, w = masks.shape
+        logits = logits_all.reshape(b * n * t, 1, logits_all.shape[-2], logits_all.shape[-1])
+        masks = masks.reshape(b * n * t, c, h, w)
+    elif masks.ndim == 4:
+        # masks: [B, 1, H, W] — single-frame target
+        if logits_all.ndim == 5:
+            logits = logits_all[:, logits_all.shape[1] // 2]
+        elif logits_all.ndim == 6:
+            logits = logits_all[:, logits_all.shape[1] // 2, logits_all.shape[2] // 2]
+        else:
+            logits = logits_all
+    else:
+        logits = logits_all[:, logits_all.shape[1] // 2] if logits_all.ndim >= 5 else logits_all
+
+    if logits.shape[-2:] != masks.shape[-2:]:
+        logits = F.interpolate(logits, size=masks.shape[-2:], mode="bilinear", align_corners=False)
+    return logits, masks
 
 
 def find_dinov3_repo(cfg: dict[str, Any], base_dir: Path) -> Path | None:
@@ -411,17 +460,10 @@ class DINOv3ViTL16InpaintingDetector(nn.Module):
             raise ValueError(f"clip channel dimension must be 3, got {channels}")
 
         if self.use_dpt_fpn:
-            # Multi-layer encoder → {layer: [B, T, 1024, 32, 32]}
-            multi_feats = self.encoder(clip)
-
-            # Decode per-frame through neck + FPN
-            logits_list: list[torch.Tensor] = []
-            for t in range(num_frames):
-                # Gather features for frame t: {layer: [B, 1024, 32, 32]}
-                frame_feats = {k: v[:, t] for k, v in multi_feats.items()}
-                pyramid = self.neck(frame_feats)  # {"p2": [B,256,128,128], ...}
-                logits = self.decoder(pyramid)     # [B, 1, 512, 512]
-                logits_list.append(logits)
+            P2, P3, P4, P5 = self.extract_fpn_features(clip)
+            logits = self.decode_fpn(P2, P3, P4, P5)
+            logits = logits.reshape(batch_size, num_frames, 1, height, width)
+            return logits
         else:
             # Single-layer encoder → [B, T, 1024, H/16, W/16]
             encoder_features = self.encoder(clip)
@@ -433,6 +475,57 @@ class DINOv3ViTL16InpaintingDetector(nn.Module):
                 logits_list.append(logits)
 
         return torch.stack(logits_list, dim=1)  # [B, T, 1, H, W]
+
+    # ------------------------------------------------------------------
+    # Public API for TFCU-Inpaint wrapper
+    # ------------------------------------------------------------------
+
+    def extract_fpn_features(
+        self, frames: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Extract multi-scale FPN feature pyramid for all frames at once.
+
+        Args:
+            frames: [B*T, 3, H, W]  (already normalised by encoder)
+
+        Returns:
+            P2: [B*T, 256, 128, 128]
+            P3: [B*T, 256,  64,  64]
+            P4: [B*T, 256,  32,  32]
+            P5: [B*T, 256,  16,  16]
+        """
+        if not self.use_dpt_fpn:
+            raise RuntimeError(
+                "extract_fpn_features requires use_dpt_fpn=True"
+            )
+        # Flatten T dim → [B*T, 3, H, W] and run multi-layer encoder
+        BxT = frames.shape[0]
+        # DinoMultiLayerEncoder expects [B, T, 3, H, W] but we only have
+        # flat frames.  Wrap with singleton T dim.
+        feats = self.encoder(frames[:, None])  # returns {layer: [B*T, 1, 1024, 32, 32]}
+        # Squeeze the singleton T dim
+        feats_flat = {k: v[:, 0] for k, v in feats.items()}
+        pyramid = self.neck(feats_flat)
+        return pyramid["p2"], pyramid["p3"], pyramid["p4"], pyramid["p5"]
+
+    def decode_fpn(
+        self,
+        P2: torch.Tensor,
+        P3: torch.Tensor,
+        P4: torch.Tensor,
+        P5: torch.Tensor,
+    ) -> torch.Tensor:
+        """Decode FPN pyramid to logits.
+
+        Args:
+            P2-P5: [B*T, 256, *, *]
+
+        Returns:
+            logits: [B*T, 1, 512, 512]
+        """
+        if not self.use_dpt_fpn:
+            raise RuntimeError("decode_fpn requires use_dpt_fpn=True")
+        return self.decoder({"p2": P2, "p3": P3, "p4": P4, "p5": P5})
 
 
 def validate_config(cfg: dict[str, Any], mode: str) -> None:
@@ -447,8 +540,10 @@ def validate_config(cfg: dict[str, Any], mode: str) -> None:
         errors.append("batch_size must be > 0")
     if int(cfg.get("grad_accum_steps", 1)) <= 0:
         errors.append("grad_accum_steps must be > 0")
-    if int(cfg.get("num_frames", 0)) <= 0 or int(cfg.get("num_frames", 0)) % 2 == 0:
-        errors.append("num_frames must be a positive odd integer")
+    if int(cfg.get("num_frames", 0)) <= 0:
+        errors.append("num_frames must be > 0")
+    elif not bool(cfg.get("use_tfcu_adapter", False)) and int(cfg.get("num_frames", 0)) % 2 == 0:
+        errors.append("num_frames must be a positive odd integer (unless use_tfcu_adapter=true)")
 
     required = ["val_samples"] if mode == "val" else ["test_samples"] if mode == "test" else ["train_samples", "val_samples"]
     for key in required:
@@ -479,7 +574,7 @@ def validate_config(cfg: dict[str, Any], mode: str) -> None:
               f"fallback to cuda:0 or CUDA_VISIBLE_DEVICES")
 
 
-def build_model(cfg: dict[str, Any], device: torch.device, base_dir: Path) -> DINOv3ViTL16InpaintingDetector:
+def build_model(cfg: dict[str, Any], device: torch.device, base_dir: Path) -> nn.Module:
     backbone = load_dinov3_backbone(cfg, base_dir)
     lora_targets = tuple(str(item).strip() for item in str(cfg.get("lora_targets", "attn.qkv,attn.proj")).split(",") if str(item).strip())
 
@@ -491,8 +586,12 @@ def build_model(cfg: dict[str, Any], device: torch.device, base_dir: Path) -> DI
         extract_layers = tuple(int(x.strip()) for x in str(extract_layers_str).split(",") if x.strip())
     neck_channels = int(cfg.get("neck_channels", 256))
     lora_block_indices = parse_lora_layers(cfg.get("lora_layers", "all"))
+    use_tfcu_adapter = bool(cfg.get("use_tfcu_adapter", False))
 
-    model = DINOv3ViTL16InpaintingDetector(
+    if use_tfcu_adapter and not use_dpt_fpn:
+        raise ValueError("use_tfcu_adapter requires use_dpt_fpn=true")
+
+    base_model = DINOv3ViTL16InpaintingDetector(
         backbone=backbone,
         freeze_backbone=bool(cfg.get("freeze_backbone", True)),
         use_lora=bool(cfg.get("use_lora", False)),
@@ -510,20 +609,60 @@ def build_model(cfg: dict[str, Any], device: torch.device, base_dir: Path) -> DI
     if checkpoint:
         state = torch.load(checkpoint, map_location="cpu")
         state_dict = state["model"] if isinstance(state, dict) and "model" in state else state
-        missing, unexpected = model.load_state_dict(state_dict, strict=False)
-        if missing:
-            print(f"[checkpoint] missing keys ({len(missing)}): "
-                  f"{missing[:5]}{'...' if len(missing) > 5 else ''}")
-        if unexpected:
-            print(f"[checkpoint] unexpected keys ({len(unexpected)}): "
-                  f"{unexpected[:5]}{'...' if len(unexpected) > 5 else ''}")
-        print(f"[checkpoint] loaded: {checkpoint}")
 
-    total, trainable = count_parameters(model)
+        if use_tfcu_adapter:
+            # Try loading into the full wrapper first (for TFCU→TFCU resume).
+            # If keys have "base." prefix, load directly; otherwise load into
+            # the base model and let the temporal adapter stay random-init.
+            model = VideoInpaintTFCU(base_model, cfg)
+            has_tfcu_keys = any(k.startswith("temporal_adapter.") for k in state_dict)
+            if has_tfcu_keys:
+                missing, unexpected = model.load_state_dict(state_dict, strict=False)
+                print(f"[checkpoint] loaded TFCU checkpoint: {checkpoint}")
+            else:
+                # Backbone-only checkpoint — load into base
+                missing, unexpected = base_model.load_state_dict(state_dict, strict=False)
+                print(f"[checkpoint] loaded backbone checkpoint into TFCU model: {checkpoint}")
+            if missing:
+                print(f"[checkpoint] missing keys ({len(missing)}): "
+                      f"{missing[:5]}{'...' if len(missing) > 5 else ''}")
+            if unexpected:
+                print(f"[checkpoint] unexpected keys ({len(unexpected)}): "
+                      f"{unexpected[:5]}{'...' if len(unexpected) > 5 else ''}")
+            total, trainable = count_parameters(model)
+            print(f"[model] DINOv3 ViT-L/16 DPT+FPN + TFCU-Inpaint Adapter")
+            print(f"[params] total {total:,} trainable {trainable:,}")
+            print(f"[temporal] num_clips={int(cfg.get('num_clips', 4))} "
+                  f"num_frames={int(cfg.get('num_frames', 1))} "
+                  f"memory_len={int(cfg.get('memory_len', 4))} "
+                  f"use_memory={bool(cfg.get('use_memory', True))}")
+            return model.to(device)
+        else:
+            missing, unexpected = base_model.load_state_dict(state_dict, strict=False)
+            if missing:
+                print(f"[checkpoint] missing keys ({len(missing)}): "
+                      f"{missing[:5]}{'...' if len(missing) > 5 else ''}")
+            if unexpected:
+                print(f"[checkpoint] unexpected keys ({len(unexpected)}): "
+                      f"{unexpected[:5]}{'...' if len(unexpected) > 5 else ''}")
+            print(f"[checkpoint] loaded: {checkpoint}")
+
+    if use_tfcu_adapter:
+        model = VideoInpaintTFCU(base_model, cfg)
+        total, trainable = count_parameters(model)
+        print(f"[model] DINOv3 ViT-L/16 DPT+FPN + TFCU-Inpaint Adapter")
+        print(f"[params] total {total:,} trainable {trainable:,}")
+        print(f"[temporal] num_clips={int(cfg.get('num_clips', 4))} "
+              f"num_frames={int(cfg.get('num_frames', 1))} "
+              f"memory_len={int(cfg.get('memory_len', 4))} "
+              f"use_memory={bool(cfg.get('use_memory', True))}")
+        return model.to(device)
+
+    total, trainable = count_parameters(base_model)
     tag = "DPT+FPN" if use_dpt_fpn else "single-layer"
-    print(f"[model] DINOv3 ViT-L/16 {tag} encoder, LoRA layers: {model.lora_layers}")
+    print(f"[model] DINOv3 ViT-L/16 {tag} encoder, LoRA layers: {base_model.lora_layers}")
     print(f"[params] total {total:,} trainable {trainable:,}")
-    return model.to(device)
+    return base_model.to(device)
 
 
 # ── Helpers: logging (dynamic loss keys) ────────────────────────────────────
@@ -604,13 +743,33 @@ def append_epoch_log(
 
 
 def forward_in_frame_chunks(model: nn.Module, frames: torch.Tensor, frame_chunk: int) -> torch.Tensor:
-    if frame_chunk <= 0 or frames.shape[1] <= frame_chunk:
+    """Chunk frames along the temporal dimension to avoid OOM.
+
+    For [B, T, ...] input, chunks along dim=1.
+    For [B, N, T, ...] input (TFCU), chunks along dim=2 (T within each clip).
+    """
+    if frame_chunk <= 0:
         return model(frames)
 
-    outputs = []
-    for start in range(0, frames.shape[1], frame_chunk):
-        outputs.append(model(frames[:, start : start + frame_chunk]))
-    return torch.cat(outputs, dim=1)
+    if frames.ndim == 5:
+        # [B, T, C, H, W]
+        if frames.shape[1] <= frame_chunk:
+            return model(frames)
+        outputs = []
+        for start in range(0, frames.shape[1], frame_chunk):
+            outputs.append(model(frames[:, start : start + frame_chunk]))
+        return torch.cat(outputs, dim=1)
+
+    if frames.ndim == 6:
+        # [B, N, T, C, H, W] — TFCU input, chunk on T (dim=2)
+        if frames.shape[2] <= frame_chunk:
+            return model(frames)
+        outputs = []
+        for start in range(0, frames.shape[2], frame_chunk):
+            outputs.append(model(frames[:, :, start : start + frame_chunk]))
+        return torch.cat(outputs, dim=2)
+
+    return model(frames)
 
 
 def run_epoch(
@@ -707,16 +866,66 @@ def train(cfg: dict[str, Any], device: torch.device, base_dir: Path) -> None:
         init_training_log(log_path, cfg, model, criterion)
         print(f"[log] writing training metrics to {log_path}")
     print(f"[loss] active: {criterion.active_names}")
-    trainable_params = [param for param in model.parameters() if param.requires_grad]
-    if not trainable_params:
-        raise RuntimeError("No trainable parameters. Enable decoder training or LoRA.")
 
-    optimizer = Adam(
-        trainable_params,
-        lr=float(cfg["learning_rate"]),
-        weight_decay=float(cfg.get("weight_decay", 0.0)),
-        betas=(0.9, 0.999),
-    )
+    use_tfcu = bool(cfg.get("use_tfcu_adapter", False))
+    base_lr = float(cfg["learning_rate"])
+    wd = float(cfg.get("weight_decay", 0.0))
+
+    if use_tfcu and isinstance(model, VideoInpaintTFCU):
+        # ── separate LR per component ────────────────────────────────
+        lr_temporal = float(cfg.get("lr_temporal", base_lr))
+        lr_decoder = float(cfg.get("lr_decoder", base_lr))
+        lr_lora = float(cfg.get("lr_lora", base_lr * 0.1))
+
+        param_groups: list[dict] = []
+
+        # Temporal adapter
+        temporal_params = list(model.temporal_adapter.parameters())
+        if temporal_params:
+            param_groups.append({
+                "params": temporal_params,
+                "lr": lr_temporal,
+                "weight_decay": wd,
+            })
+
+        # Decoder (base.decoder + base.neck)
+        decoder_params = []
+        if hasattr(model.base, "decoder"):
+            decoder_params.extend(model.base.decoder.parameters())
+        if hasattr(model.base, "neck") and model.base.neck is not None:
+            decoder_params.extend(model.base.neck.parameters())
+        if decoder_params:
+            param_groups.append({
+                "params": decoder_params,
+                "lr": lr_decoder,
+                "weight_decay": wd,
+            })
+
+        # LoRA / backbone trainable params (everything else)
+        managed = set(id(p) for g in param_groups for p in g["params"])
+        other_params = [p for p in model.parameters() if p.requires_grad and id(p) not in managed]
+        if other_params:
+            param_groups.append({
+                "params": other_params,
+                "lr": lr_lora,
+                "weight_decay": wd,
+            })
+
+        if not param_groups:
+            raise RuntimeError("No trainable parameters in TFCU model.")
+        print(f"[optim] temporal lr={lr_temporal} decoder lr={lr_decoder} lora lr={lr_lora}")
+        optimizer = Adam(param_groups, betas=(0.9, 0.999))
+    else:
+        # ── single param group (legacy) ───────────────────────────────
+        trainable_params = [param for param in model.parameters() if param.requires_grad]
+        if not trainable_params:
+            raise RuntimeError("No trainable parameters. Enable decoder training or LoRA.")
+        optimizer = Adam(
+            trainable_params,
+            lr=base_lr,
+            weight_decay=wd,
+            betas=(0.9, 0.999),
+        )
     # ── LR scheduler ──────────────────────────────────────────────────────
     scheduler_type = str(cfg.get("scheduler", "cosine")).strip().lower()
     max_epochs = int(cfg["n_epochs"])
@@ -961,6 +1170,17 @@ def main() -> None:
     parser.add_argument("--visualization_dir", type=str, default=None)
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--gpu_id", type=int, default=None)
+    # TFCU adapter options
+    parser.add_argument("--use_tfcu_adapter", type=str2bool, default=None)
+    parser.add_argument("--num_clips", type=int, default=None)
+    parser.add_argument("--clip_stride", type=int, default=None)
+    parser.add_argument("--memory_len", type=int, default=None)
+    parser.add_argument("--use_memory", type=str2bool, default=None)
+    parser.add_argument("--detach_memory", type=str2bool, default=None)
+    parser.add_argument("--use_spatial_pool", type=str2bool, default=None)
+    parser.add_argument("--lr_temporal", type=float, default=None)
+    parser.add_argument("--lr_decoder", type=float, default=None)
+    parser.add_argument("--lr_lora", type=float, default=None)
     args = parser.parse_args()
 
     cfg_path = resolve_config_path(args.config)
@@ -984,6 +1204,17 @@ def main() -> None:
         "grad_accum_steps": 1,
         "eval_frame_chunk": 1,
         "gpu_id": 0,
+        # TFCU defaults
+        "use_tfcu_adapter": False,
+        "num_clips": 1,
+        "clip_stride": 1,
+        "memory_len": 4,
+        "use_memory": True,
+        "detach_memory": True,
+        "use_spatial_pool": False,
+        "lr_temporal": 1e-4,
+        "lr_decoder": 1e-4,
+        "lr_lora": 1e-5,
     }
     for key, value in defaults.items():
         cfg.setdefault(key, value)
@@ -1019,6 +1250,12 @@ def main() -> None:
     decoder_tag = "DPT+FPN" if bool(cfg.get("use_dpt_fpn", False)) else "single-layer ProgressiveDecoder"
     print(f"[dinov3] encoder: {decoder_tag}")
     print(f"[lora] enabled={bool(cfg.get('use_lora', False))} rank={int(cfg.get('lora_rank', 4))}")
+
+    if bool(cfg.get("use_tfcu_adapter", False)):
+        print(f"[tfcu] adapter enabled  num_clips={int(cfg.get('num_clips', 4))} "
+              f"num_frames={int(cfg.get('num_frames', 1))} "
+              f"memory_len={int(cfg.get('memory_len', 4))} "
+              f"use_memory={bool(cfg.get('use_memory', True))}")
 
     if mode == "train":
         train(cfg, device, base_dir)

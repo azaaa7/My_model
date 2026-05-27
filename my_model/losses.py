@@ -207,8 +207,98 @@ class WeightedBCELoss(nn.Module):
         return loss.mean()
 
 
+class BoundaryLoss(nn.Module):
+    """L1 loss on Sobel edge maps — encourages sharp, accurate boundaries.
+
+    Computes the Sobel gradient magnitude of both predicted mask (sigmoid)
+    and ground-truth mask, then applies L1 loss between them.
+
+    Args:
+        kernel_size: Sobel kernel size (always 3 for now).
+    """
+
+    def __init__(self, kernel_size: int = 3):
+        super().__init__()
+        self.kernel_size = kernel_size
+
+    @staticmethod
+    def sobel(x: torch.Tensor) -> torch.Tensor:
+        """Sobel edge magnitude for [*, 1, H, W] input."""
+        device = x.device
+        dtype = x.dtype
+
+        kx = torch.tensor(
+            [[-1, 0, 1],
+             [-2, 0, 2],
+             [-1, 0, 1]],
+            device=device,
+            dtype=dtype,
+        ).view(1, 1, 3, 3)
+
+        ky = torch.tensor(
+            [[-1, -2, -1],
+             [0, 0, 0],
+             [1, 2, 1]],
+            device=device,
+            dtype=dtype,
+        ).view(1, 1, 3, 3)
+
+        gx = F.conv2d(x, kx, padding=1)
+        gy = F.conv2d(x, ky, padding=1)
+        return torch.sqrt(gx * gx + gy * gy + 1e-6)
+
+    @staticmethod
+    def _flatten_extra_dims(
+        logits: torch.Tensor,
+        target: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Flatten [B,N,T,1,H,W] or [B,T,1,H,W] → [*,1,H,W]."""
+        if logits.dim() == 6:
+            B, N, T, C, H, W = logits.shape
+            logits = logits.reshape(B * N * T, C, H, W)
+            target = target.reshape(B * N * T, C, H, W)
+        elif logits.dim() == 5:
+            B, T, C, H, W = logits.shape
+            logits = logits.reshape(B * T, C, H, W)
+            target = target.reshape(B * T, C, H, W)
+        return logits, target
+
+    def forward(self, logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        logits, target = self._flatten_extra_dims(logits, target)
+        pred = torch.sigmoid(logits)
+        pred_b = self.sobel(pred)
+        target_b = self.sobel(target.float())
+        return F.l1_loss(pred_b, target_b)
+
+
+class TemporalDeltaLoss(nn.Module):
+    """L1 loss on frame-to-frame prediction differences.
+
+    Penalises temporal inconsistency: the difference between consecutive
+    predicted masks should match the difference between consecutive GT masks.
+
+    If T <= 1 the loss gracefully returns 0.
+    """
+
+    def forward(self, logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        # Handle [B,T,1,H,W] or [B,N,T,1,H,W]
+        if logits.dim() == 5:
+            logits = logits[:, None]    # [B,1,T,1,H,W]
+            target = target[:, None]
+
+        if logits.shape[2] <= 1:
+            return logits.sum() * 0.0   # no temporal dimension to diff
+
+        pred = torch.sigmoid(logits)                              # [B,N,T,1,H,W]
+
+        dp = pred[:, :, 1:] - pred[:, :, :-1]                     # [B,N,T-1,1,H,W]
+        dg = target[:, :, 1:].float() - target[:, :, :-1].float()
+
+        return F.l1_loss(dp, dg)
+
+
 class SegmentationLoss(nn.Module):
-    """Config-driven loss: freely combine WBce / Dice / Focal / IoU / BCE / Tversky.
+    """Config-driven loss: freely combine WBce / Dice / Focal / IoU / BCE / Tversky / Edge / Boundary / TemporalDelta.
 
     Configure via YAML:
 
@@ -237,12 +327,16 @@ class SegmentationLoss(nn.Module):
             weight: 1.0
             edge_lambda: 20.0
             kernel_size: 3
+          boundary:
+            weight: 0.2
+          temporal_delta:
+            weight: 0.1
 
     Any subset is valid.  Weights are normalised by the caller if desired;
     here they are applied as-is so the sum reflects the relative contribution.
     """
 
-    SUPPORTED = {"wbce", "dice", "focal", "iou", "bce", "tversky", "edge"}
+    SUPPORTED = {"wbce", "dice", "focal", "iou", "bce", "tversky", "edge", "boundary", "temporal_delta"}
 
     def __init__(self, loss_cfg: dict | None = None):
         super().__init__()
@@ -288,6 +382,12 @@ class SegmentationLoss(nn.Module):
                     edge_lambda=float(args.get("edge_lambda", 20.0)),
                     kernel_size=int(args.get("kernel_size", 3)),
                 )
+            elif name == "boundary":
+                self.loss_modules[name] = BoundaryLoss(
+                    kernel_size=int(args.get("kernel_size", 3)),
+                )
+            elif name == "temporal_delta":
+                self.loss_modules[name] = TemporalDeltaLoss()
             elif name == "bce":
                 self.loss_modules[name] = None  # marker, handled in forward
 
@@ -331,6 +431,12 @@ class SegmentationLoss(nn.Module):
                 val = module(logits, target)
             elif name == "edge":
                 # EdgeLoss internally handles sigmoid (BCEWithLogits)
+                val = module(logits, target)
+            elif name == "boundary":
+                # BoundaryLoss internally handles sigmoid
+                val = module(logits, target)
+            elif name == "temporal_delta":
+                # TemporalDeltaLoss internally handles sigmoid
                 val = module(logits, target)
             else:
                 val = module(logits, target)

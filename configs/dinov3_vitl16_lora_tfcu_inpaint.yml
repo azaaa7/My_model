@@ -1,0 +1,108 @@
+# DINOv3 ViT-L/16 + LoRA + DPT-FPN + TFCU-Inpaint Adapter
+# Video Inpainting Detection Configuration
+type: train
+
+# ── Data ──────────────────────────────────────────────────────────────────
+train_samples:
+  - "./flist/DAVIS-VI_tra_DVI_30.npy"
+  - "./flist/DAVIS-VI_tra_CPNET_30.npy"
+val_samples:
+  - "./flist/DAVIS-VI_val_DVI_20.npy"
+  - "./flist/DAVIS-VI_val_CPNET_20.npy"
+test_samples:
+  - "./flist/DAVIS-VI_val_DVI_20.npy"
+  - "./flist/DAVIS-VI_val_CPNET_20.npy"
+  - "./flist/DAVIS-VI_val_OPN_20.npy"
+
+input_size: 512
+gt_ratio: 1
+
+# ── Temporal clip config ──────────────────────────────────────────────────
+# num_clips: clips per video sample (N dimension)
+# num_frames: frames per clip (T dimension)
+# In TFCU mode num_frames can be even (e.g. 4).
+num_clips: 4
+num_frames: 3
+clip_stride: 1
+
+val_num_frames: 3
+dataset_repeat: 1
+batch_size: 1
+num_workers: 4
+grad_accum_steps: 8
+
+# ── DINOv3 backbone ──────────────────────────────────────────────────────
+dinov3_weights: "./runs/dinov3_vitl16/dinov3_vitl16_pretrain_lvd1689m-8aa4cbdd.pth"
+dinov3_repo: "./dinov3"
+allow_hub_download: false
+
+# ── Model ────────────────────────────────────────────────────────────────
+use_dpt_fpn: true
+extract_layers: "11,15,19,23"
+neck_channels: 256
+freeze_backbone: true
+checkpoint: ""
+
+# ── LoRA ──────────────────────────────────────────────────────────────────
+use_lora: true
+lora_rank: 32
+lora_alpha: 64
+lora_dropout: 0.1
+lora_targets: "attn.qkv,attn.proj,mlp.fc1,mlp.fc2"
+lora_layers: "all"
+
+# ── TFCU-Inpaint Adapter ──────────────────────────────────────────────────
+use_tfcu_adapter: true
+temporal_insert_level: P4
+memory_len: 4
+use_memory: true
+detach_memory: true
+use_spatial_pool: false
+
+# ── Optimizer (per-component learning rates) ──────────────────────────────
+learning_rate: 1.0e-4
+lr_temporal: 1.0e-4
+lr_decoder:  1.0e-4
+lr_lora:     1.0e-5
+weight_decay: 1.0e-4
+
+# ── LR scheduler ──────────────────────────────────────────────────────────
+scheduler: "cosine"
+warmup_epochs: 10
+min_lr: 1.0e-6
+
+# Plateau scheduler options (only used when scheduler="plateau")
+plateau_patience: 3
+plateau_threshold: 0.003
+plateau_cooldown: 1
+
+# ── Loss ──────────────────────────────────────────────────────────────────
+# Supported: wbce, dice, focal, iou, bce, tversky, edge, boundary, temporal_delta
+loss:
+  dice:
+    weight: 1.0
+    smooth: 1.0e-6
+  bce:
+    weight: 0.5
+  tversky:
+    weight: 0.2
+    alpha: 0.3
+    beta: 0.7
+    smooth: 1.0e-6
+  boundary:
+    weight: 0.2
+  temporal_delta:
+    weight: 0.1
+
+# ── Training ──────────────────────────────────────────────────────────────
+n_epochs: 2000
+seed: 666666
+amp: true
+gpu_id: 0
+validate_every: 20
+threshold: 0.5
+eval_frame_chunk: 1
+
+# ── Output ────────────────────────────────────────────────────────────────
+save_dir: "runs/dinov3_vitl16_tfcu_inpaint"
+visualization_dir: "runs/dinov3_vitl16_tfcu_inpaint/vis"
