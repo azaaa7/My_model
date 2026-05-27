@@ -77,6 +77,8 @@ def make_loader(cfg: dict[str, Any], mode: str):
         input_size=cfg["input_size"],
         gt_ratio=cfg["gt_ratio"],
         num_frames=cfg["num_frames"],
+        val_num_frames=cfg.get("val_num_frames", 0),
+        dataset_repeat=cfg.get("dataset_repeat", 1),
         robust_noise_snr=cfg.get("robust_noise_snr", 0),
         robust_jpeg_quality=cfg.get("robust_jpeg_quality", 0),
     )

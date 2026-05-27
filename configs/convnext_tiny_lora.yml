@@ -7,6 +7,8 @@ test_samples: "./flist/DAVIS-VI_val_CPNET_20.npy"
 input_size: 512
 gt_ratio: 1
 num_frames: 1
+val_num_frames: 8
+dataset_repeat: 1
 batch_size: 2
 num_workers: 4
 

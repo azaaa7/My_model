@@ -68,6 +68,7 @@ def _sample_indices(
     video_length: int,
     mode: str,
     num_frames: int = 5,
+    val_num_frames: int = 0,
 ) -> List[int]:
     half = num_frames // 2
 
@@ -76,6 +77,13 @@ def _sample_indices(
         return [min(max(center + offset, 0), video_length - 1) for offset in range(-half, half + 1)]
 
     if mode == "val":
+        if val_num_frames > 0:
+            # 等间隔采样 val_num_frames 帧，保证每个视频帧数一致
+            if video_length <= val_num_frames:
+                return list(range(video_length))
+            step = (video_length - 1) / (val_num_frames - 1) if val_num_frames > 1 else 0.0
+            return [min(round(i * step), video_length - 1) for i in range(val_num_frames)]
+        # fallback: 中心连续帧 (与 train 相同逻辑)
         center = video_length // 2
         return [min(max(center + offset, 0), video_length - 1) for offset in range(-half, half + 1)]
 
@@ -120,8 +128,10 @@ class VideoInpaintingDataset(Dataset):
     """
     可配置奇数帧输入的视频 inpainting 数据集。
 
-    训练 / 验证:
+    训练:
         return frames, center_mask, H, W, name
+    验证:
+        return frames, all_masks, H, W, name  (等间隔 val_num_frames 帧)
     测试 / 推理:
         return frames, all_masks, H, W, name
     """
@@ -133,6 +143,8 @@ class VideoInpaintingDataset(Dataset):
         input_size: int = 512,
         gt_ratio: int = 1,
         num_frames: int = 5,
+        val_num_frames: int = 0,
+        dataset_repeat: int = 1,
         augment_prob: float = 0.75,
         robust_noise_snr: int = 0,
         robust_jpeg_quality: int = 0,
@@ -144,6 +156,8 @@ class VideoInpaintingDataset(Dataset):
         self.input_size = input_size
         self.gt_ratio = gt_ratio
         self.num_frames = num_frames
+        self.val_num_frames = val_num_frames
+        self.dataset_repeat = dataset_repeat
         self.augment_prob = augment_prob
         self.robust_noise_snr = robust_noise_snr
         self.robust_jpeg_quality = robust_jpeg_quality
@@ -155,9 +169,10 @@ class VideoInpaintingDataset(Dataset):
         self.replay_aug = build_replay_augmenter()
 
     def __len__(self) -> int:
-        return len(self.samples)
+        return len(self.samples) * self.dataset_repeat
 
     def __getitem__(self, idx: int):
+        idx = idx % len(self.samples)  # 支持 dataset_repeat：取模映射到原始样本
         video_dir, mask_dir = self.samples[idx]
         frame_list = sorted([p for p in os.listdir(video_dir) if is_image_file(p)])
         mask_list = sorted([p for p in os.listdir(mask_dir) if is_image_file(p)])
@@ -169,7 +184,7 @@ class VideoInpaintingDataset(Dataset):
             )
 
         video_length = len(frame_list)
-        indices = _sample_indices(video_length, self.mode, self.num_frames)
+        indices = _sample_indices(video_length, self.mode, self.num_frames, self.val_num_frames)
         name = _derive_sample_name(video_dir)
 
         frames: List[np.ndarray] = []
@@ -209,8 +224,13 @@ class VideoInpaintingDataset(Dataset):
         mask_tensors = []
         for img, mask in zip(frames, masks):
             img = cv2.resize(img, (self.input_size, self.input_size))
-            mask = cv2.resize(mask, (self.input_size // self.gt_ratio, self.input_size // self.gt_ratio))
-            mask = threshold_mask(mask)
+
+            if self.mode == "train":
+                # Train: resize mask to model output resolution for efficient loss computation.
+                mask = cv2.resize(mask, (self.input_size // self.gt_ratio, self.input_size // self.gt_ratio))
+                mask = threshold_mask(mask)
+            # val / test: keep mask at original (aligned) resolution.
+            # align_logits_and_masks will upsample logits to match.
 
             img = img.astype(np.float32) / 255.0
             mask = mask.astype(np.float32) / 255.0
@@ -221,7 +241,7 @@ class VideoInpaintingDataset(Dataset):
         frames_out = torch.cat(frame_tensors, dim=0)
         masks_out = torch.cat(mask_tensors, dim=0)
 
-        if self.mode in ("train", "val"):
+        if self.mode == "train":
             return frames_out, masks_out[self.num_frames // 2], original_h, original_w, name
         return frames_out, masks_out, original_h, original_w, name
 

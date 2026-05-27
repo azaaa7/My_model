@@ -1,4 +1,7 @@
 from __future__ import annotations
+import warnings
+warnings.filterwarnings("ignore")
+
 
 import importlib.util
 from pathlib import Path

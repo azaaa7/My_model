@@ -11,9 +11,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim import Adam
-from torch.optim.lr_scheduler import ReduceLROnPlateau
+from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, ReduceLROnPlateau, SequentialLR
 
 from my_model import SegmentationLoss
+from my_model.dinov3_dpt_fpn import DPTReassembleNeck, FPNDecoder
 from my_model.metrics import AverageMeter, binary_metrics_from_logits, set_seed
 from train_val_test_convnext_lora import (
     align_logits_and_masks,
@@ -99,6 +100,7 @@ def add_peft_lora_to_backbone(
     rank: int = 4,
     alpha: float = 8.0,
     dropout: float = 0.0,
+    lora_layers: list[int] | None = None,
 ) -> tuple[nn.Module, int]:
     try:
         from peft import LoraConfig, inject_adapter_in_model
@@ -115,101 +117,63 @@ def add_peft_lora_to_backbone(
         lora_dropout=dropout,
         bias="none",
     )
+    if lora_layers is not None and len(lora_layers) > 0:
+        # PEFT's layers_to_transform uses hf-style naming (model.layers.X)
+        # which is incompatible with DINOv3's blocks.X naming.  Generate
+        # explicit per-block target names for suffix matching instead.
+        explicit_targets = []
+        for idx in lora_layers:
+            for suffix in target_suffixes:
+                explicit_targets.append(f"blocks.{idx}.{suffix}")
+        config.target_modules = explicit_targets
     backbone = inject_adapter_in_model(config, backbone)
-    lora_layers = sum(1 for _, module in backbone.named_modules() if hasattr(module, "lora_A"))
-    return backbone, lora_layers
+    lora_count = sum(1 for _, module in backbone.named_modules() if hasattr(module, "lora_A"))
+    return backbone, lora_count
 
 
-# ── Helper blocks (GN-based) ──────────────────────────────────────────────
+def parse_lora_layers(value: str) -> list[int] | None:
+    """Parse lora_layers config string to list of ints or None.
 
-class ConvGNGLU(nn.Sequential):
-    """Conv2d + GroupNorm + GELU"""
-    def __init__(self, in_channels: int, out_channels: int, kernel_size: int = 3, stride: int = 1, num_groups: int = 16):
-        padding = kernel_size // 2
-        gn_groups = min(num_groups, out_channels)
-        super().__init__(
-            nn.Conv2d(in_channels, out_channels, kernel_size=kernel_size, stride=stride, padding=padding, bias=False),
-            nn.GroupNorm(gn_groups, out_channels),
-            nn.GELU(),
-        )
-
-
-class LayerNormChannel(nn.Module):
-    """LayerNorm applied over channel dim for 4D conv features [B, C, H, W]."""
-    def __init__(self, channels: int):
-        super().__init__()
-        self.norm = nn.LayerNorm(channels)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        B, C, H, W = x.shape
-        x = x.reshape(B, C, -1).transpose(1, 2)  # [B, HW, C]
-        x = self.norm(x)
-        return x.transpose(1, 2).reshape(B, C, H, W)
+    "all" / ""  →  None (all layers)
+    "5-23"      →  [5, 6, ..., 23]
+    "5,11,17,23"→  [5, 11, 17, 23]
+    """
+    if not value or str(value).strip().lower() in ("all", ""):
+        return None
+    value = str(value).strip()
+    if "-" in value and "," not in value:
+        parts = value.split("-")
+        if len(parts) == 2:
+            return list(range(int(parts[0]), int(parts[1]) + 1))
+    return [int(x.strip()) for x in value.split(",") if x.strip().isdigit()]
 
 
-class ResidualBlockGN(nn.Module):
-    """Conv3×3 → GN → GELU → Conv3×3 → GN → GELU + skip connection"""
-    def __init__(self, channels: int, num_groups: int = 16):
-        super().__init__()
-        gn_groups = min(num_groups, channels)
-        self.block = nn.Sequential(
-            nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False),
-            nn.GroupNorm(gn_groups, channels),
-            nn.GELU(),
-            nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False),
-            nn.GroupNorm(gn_groups, channels),
-        )
-        self.act = nn.GELU()
+# ── DINOv3 Single-layer Patch Encoder ─────────────────────────────────────
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.act(x + self.block(x))
+class DinoSingleLayerEncoder(nn.Module):
+    """Extract the last layer DINOv3 patch tokens without channel modification.
 
-
-# ── DINOv3 Multi-layer Patch Encoder ──────────────────────────────────────
-
-class DinoMultiLayerPatchEncoder(nn.Module):
-    """Extract multi-layer DINOv3 patch tokens and fuse into unified features.
+    Only extracts the final ViT block's patch token features at 1024-dim,
+    no multi-layer fusion or channel projection.
 
     Args:
         backbone: DINOv3 VisionTransformer
-        selected_layers: list of 0-indexed block indices to extract (default [5,11,17,23])
-        out_dim: target fusion channel dimension (default 256)
+        last_layer_idx: 0-indexed block index to extract (default 23 for ViT-L/24)
         freeze_backbone: whether backbone params require grad
         use_lora: whether LoRA was injected on backbone
     """
     def __init__(
         self,
         backbone: nn.Module,
-        selected_layers: list[int] | None = None,
-        out_dim: int = 256,
+        last_layer_idx: int = 23,
         freeze_backbone: bool = True,
         use_lora: bool = False,
     ):
         super().__init__()
         self.backbone = backbone
-        self.selected_layers = selected_layers or [5, 11, 17, 23]
-        self.num_layers = len(self.selected_layers)
+        self.last_layer_idx = last_layer_idx
         self.freeze_backbone = freeze_backbone
         self.use_lora = use_lora
-
-        # Per-layer projector: LN → Conv1×1 (embed_dim → out_dim)
-        self.layer_projectors = nn.ModuleList()
-        for _ in range(self.num_layers):
-            self.layer_projectors.append(nn.Sequential(
-                LayerNormChannel(DINOV3_FEATURE_DIM),
-                nn.Conv2d(DINOV3_FEATURE_DIM, out_dim, kernel_size=1, bias=False),
-            ))
-
-        # Fusion: concat(num_layers * out_dim) → out_dim
-        fusion_in = self.num_layers * out_dim
-        self.fusion = nn.Sequential(
-            nn.Conv2d(fusion_in, out_dim * 2, kernel_size=1, bias=False),
-            nn.GroupNorm(min(16, out_dim * 2), out_dim * 2),
-            nn.GELU(),
-            nn.Conv2d(out_dim * 2, out_dim, kernel_size=3, padding=1, bias=False),
-            nn.GroupNorm(min(16, out_dim), out_dim),
-            nn.GELU(),
-        )
 
         # ImageNet normalization buffers
         mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
@@ -218,13 +182,13 @@ class DinoMultiLayerPatchEncoder(nn.Module):
         self.register_buffer("image_std", std)
 
     def forward(self, video: torch.Tensor) -> torch.Tensor:
-        """Extract fused multi-layer features.
+        """Extract last-layer patch features.
 
         Args:
             video: [B, T, 3, H, W] RGB in [0, 1]
 
         Returns:
-            fused_features: [B, T, out_dim, H//16, W//16]
+            features: [B, T, 1024, H//16, W//16]
         """
         B, T, C, H, W = video.shape
         frames = video.reshape(B * T, C, H, W)
@@ -232,155 +196,163 @@ class DinoMultiLayerPatchEncoder(nn.Module):
 
         with torch.set_grad_enabled(not (self.freeze_backbone and not self.use_lora)):
             layer_outputs = self.backbone.get_intermediate_layers(
-                normalized, n=self.selected_layers, reshape=True, norm=True
+                normalized, n=[self.last_layer_idx], reshape=True, norm=True
             )
 
-        projected = []
-        for i, feats in enumerate(layer_outputs):
-            proj = self.layer_projectors[i](feats)
-            projected.append(proj)
-
-        concat = torch.cat(projected, dim=1)
-        fused = self.fusion(concat)
-
-        return fused.reshape(B, T, *fused.shape[1:])
+        features = layer_outputs[0]  # [B*T, 1024, H/16, W/16]
+        return features.reshape(B, T, *features.shape[1:])
 
 
-# ── High-frequency Boundary Branch ────────────────────────────────────────
+# ── Simple Segmentation Head (DINOv3-IML style) ───────────────────────────
 
-# ── Progressive Upsampling Decoder ────────────────────────────────────────
+class SimpleSegHead(nn.Module):
+    """Lightweight conv head from DINOv3-IML (Irennnne et al., 2026).
 
-class ProgressiveDecoder(nn.Module):
-    """Progressive upsampling decoder without boundary guidance.
-
-    Generates coarse_mask_logits internally from encoder feature,
-    then progressively upsamples from 1/16 to full resolution.
+    Architecture:
+        Conv3×3 (feat_dim → feat_dim/2) → BN → ReLU
+        Conv3×3 (feat_dim/2 → feat_dim/4) → BN → ReLU
+        Conv1×1 (feat_dim/4 → 1)
+        → bilinear upsample to input_size
 
     Args:
-        encoder_dim: channel dimension from encoder (default 256)
-        num_groups: GroupNorm groups
+        feat_dim: DINOv3 feature dimension (1024 for ViT-L)
+        input_size: target mask resolution (default 512)
     """
-    def __init__(
-        self,
-        encoder_dim: int = 256,
-        num_groups: int = 16,
-    ):
+
+    def __init__(self, feat_dim: int = 1024, input_size: int = 512):
         super().__init__()
-        self.encoder_dim = encoder_dim
-
-        # Coarse mask head (generated from encoder feature)
-        self.coarse_head = nn.Conv2d(encoder_dim, 1, kernel_size=1)
-
-        # 1/16 fusion: concat(encoder_feature + coarse_mask) → encoder_dim
-        self.fuse_16 = nn.Sequential(
-            nn.Conv2d(encoder_dim + 1, encoder_dim, kernel_size=1, bias=False),
-            nn.GroupNorm(min(num_groups, encoder_dim), encoder_dim),
-            nn.GELU(),
-            nn.Conv2d(encoder_dim, encoder_dim, kernel_size=3, padding=1, bias=False),
-            nn.GroupNorm(min(num_groups, encoder_dim), encoder_dim),
-            nn.GELU(),
+        self.input_size = input_size
+        self.head = nn.Sequential(
+            nn.Conv2d(feat_dim, feat_dim // 2, kernel_size=3, padding=1),
+            nn.BatchNorm2d(feat_dim // 2),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(feat_dim // 2, feat_dim // 4, kernel_size=3, padding=1),
+            nn.BatchNorm2d(feat_dim // 4),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(feat_dim // 4, 1, kernel_size=1),
         )
+        self._init_weights()
 
-        # 1/16 → 1/8: 256 → 192
-        self.up_8 = nn.Sequential(
-            nn.Conv2d(encoder_dim, 192, kernel_size=3, padding=1, bias=False),
-            nn.GroupNorm(min(num_groups, 192), 192),
-            nn.GELU(),
-            nn.Conv2d(192, 192, kernel_size=3, padding=1, bias=False),
-            nn.GroupNorm(min(num_groups, 192), 192),
-            nn.GELU(),
-        )
-
-        # 1/8 → 1/4: 192 → 128
-        self.up_4 = nn.Sequential(
-            nn.Conv2d(192, 128, kernel_size=3, padding=1, bias=False),
-            nn.GroupNorm(min(num_groups, 128), 128),
-            nn.GELU(),
-            nn.Conv2d(128, 128, kernel_size=3, padding=1, bias=False),
-            nn.GroupNorm(min(num_groups, 128), 128),
-            nn.GELU(),
-        )
-
-        # 1/4 → Full resolution (two-step refinement)
-        self.head_1 = nn.Sequential(
-            nn.Conv2d(128, 64, kernel_size=3, padding=1, bias=False),
-            nn.GroupNorm(min(num_groups, 64), 64),
-            nn.GELU(),
-        )
-        self.head_2 = nn.Sequential(
-            nn.Conv2d(64, 32, kernel_size=3, padding=1, bias=False),
-            nn.GroupNorm(min(num_groups, 32), 32),
-            nn.GELU(),
-        )
-        self.head_pred = nn.Conv2d(32, 1, kernel_size=1)
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode="fan_out")
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
 
     def forward(self, encoder_feature_t: torch.Tensor) -> torch.Tensor:
         """Decode mask from encoder feature.
 
         Args:
-            encoder_feature_t: [B, encoder_dim, h, w]
+            encoder_feature_t: [B, 1024, h, w] single-frame encoder output
 
         Returns:
-            mask_logits: [B, 1, H, W]
+            mask_logits: [B, 1, input_size, input_size]
         """
-        # Coarse mask logits from encoder feature
-        coarse_mask = self.coarse_head(encoder_feature_t)  # [B, 1, h, w]
+        x = self.head(encoder_feature_t)  # [B, 1, h, w]
+        x = F.interpolate(x, size=(self.input_size, self.input_size),
+                          mode="bilinear", align_corners=False)
+        return x
 
-        # 1/16 fusion
-        d_16 = torch.cat([encoder_feature_t, coarse_mask], dim=1)
-        d_16 = self.fuse_16(d_16)  # [B, encoder_dim, h, w]
 
-        # 1/16 → 1/8
-        d_8 = F.interpolate(d_16, scale_factor=2, mode="bilinear", align_corners=False)
-        d_8 = self.up_8(d_8)  # [B, 192, H/8, W/8]
+# ── DINOv3 Multi-layer Patch Encoder ──────────────────────────────────────
 
-        # 1/8 → 1/4
-        d_4 = F.interpolate(d_8, scale_factor=2, mode="bilinear", align_corners=False)
-        d_4 = self.up_4(d_4)  # [B, 128, H/4, W/4]
+class DinoMultiLayerEncoder(nn.Module):
+    """Extract multiple DINOv3 block patch token outputs for DPT neck.
 
-        # 1/4 → Full
-        x = F.interpolate(d_4, scale_factor=2, mode="bilinear", align_corners=False)
-        x = self.head_1(x)      # [B, 64, H/2, W/2]
-        x = F.interpolate(x, scale_factor=2, mode="bilinear", align_corners=False)
-        x = self.head_2(x)      # [B, 32, H, W]
-        mask_logits = self.head_pred(x)  # [B, 1, H, W]
+    Extracts token maps from specified ViT blocks (all at 32×32, 1024-dim),
+    suitable as input to DPTReassembleNeck.
 
-        return mask_logits
+    Args:
+        backbone: DINOv3 VisionTransformer (with LoRA already injected)
+        extract_layers: 0-indexed block indices, e.g. (5, 11, 17, 23)
+        freeze_backbone: whether backbone params require grad
+        use_lora: whether LoRA was injected on backbone
+    """
+
+    def __init__(
+        self,
+        backbone: nn.Module,
+        extract_layers: tuple[int, ...] = (5, 11, 17, 23),
+        freeze_backbone: bool = True,
+        use_lora: bool = False,
+    ):
+        super().__init__()
+        self.backbone = backbone
+        self.extract_layers = list(extract_layers)
+        self.freeze_backbone = freeze_backbone
+        self.use_lora = use_lora
+
+        mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
+        std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
+        self.register_buffer("image_mean", mean)
+        self.register_buffer("image_std", std)
+
+    def forward(self, video: torch.Tensor) -> dict[int, torch.Tensor]:
+        """Extract multi-layer patch features.
+
+        Args:
+            video: [B, T, 3, H, W] RGB in [0, 1]
+
+        Returns:
+            features: {layer_idx: [B, T, 1024, H//16, W//16], ...}
+        """
+        B, T, C, H, W = video.shape
+        frames = video.reshape(B * T, C, H, W)
+        normalized = (frames - self.image_mean) / self.image_std
+
+        with torch.set_grad_enabled(not (self.freeze_backbone and not self.use_lora)):
+            layer_outputs = self.backbone.get_intermediate_layers(
+                normalized, n=self.extract_layers, reshape=True, norm=True,
+            )
+
+        # layer_outputs is tuple of [B*T, 1024, H/16, W/16] per layer
+        feats: dict[int, torch.Tensor] = {}
+        for idx, feat in zip(self.extract_layers, layer_outputs):
+            feats[idx] = feat.reshape(B, T, *feat.shape[1:])
+
+        return feats
 
 
 class DINOv3ViTL16InpaintingDetector(nn.Module):
     """
-    DINOv3 ViT-L/16 comparison model with multi-layer encoder and
-    frequency-guided boundary decoder.
+    DINOv3 ViT-L/16 model with single-layer encoder and progressive upsampling decoder.
 
-    This matches the official hub model named dinov3_vitl16 and the local
-    weight file dinov3_vitl16_pretrain_lvd1689m-8aa4cbdd.pth.
+    Extracts the last ViT block's patch tokens at 1024-dim (no channel projection),
+    then decodes via progressive 2× upsampling with ConvBlock at each scale:
+        1024(1/16) → 512(1/8) → 256(1/4) → 128(1/2) → 64(1/2) → 32(1/1) → 1 (mask)
 
     Input:
         clip: [B, T, 3, H, W], RGB in [0, 1]
 
     Output:
         mask_logits: [B, T, 1, H, W]
-        or dict with "mask_logits" and "edge_logits" when use_edge_head=True
     """
 
     def __init__(
         self,
         backbone: nn.Module,
-        selected_layers: list[int] | None = None,
-        encoder_dim: int = 256,
-        decoder_channels: int = 256,
+        last_layer_idx: int = 23,
         freeze_backbone: bool = True,
         use_lora: bool = False,
         lora_rank: int = 4,
         lora_alpha: float = 8.0,
         lora_dropout: float = 0.0,
         lora_targets: tuple[str, ...] = DEFAULT_LORA_TARGETS,
+        *,
+        use_dpt_fpn: bool = False,
+        extract_layers: tuple[int, ...] = (5, 11, 17, 23),
+        neck_channels: int = 256,
+        lora_block_indices: list[int] | None = None,
     ):
         super().__init__()
         self.backbone = backbone
         self.freeze_backbone = freeze_backbone
         self.use_lora = use_lora
+        self.use_dpt_fpn = use_dpt_fpn
 
         # LoRA injection (before freezing so LoRA params stay trainable)
         self.lora_layers = 0
@@ -393,6 +365,7 @@ class DINOv3ViTL16InpaintingDetector(nn.Module):
                 rank=lora_rank,
                 alpha=lora_alpha,
                 dropout=lora_dropout,
+                lora_layers=lora_block_indices,
             )
             if self.lora_layers == 0:
                 raise RuntimeError(f"No DINOv3 Linear layers matched LoRA targets: {lora_targets}")
@@ -402,17 +375,32 @@ class DINOv3ViTL16InpaintingDetector(nn.Module):
             for param in self.backbone.parameters():
                 param.requires_grad = False
 
-        # Multi-layer encoder
-        self.encoder = DinoMultiLayerPatchEncoder(
-            backbone=self.backbone,
-            selected_layers=selected_layers or [5, 11, 17, 23],
-            out_dim=encoder_dim,
-            freeze_backbone=freeze_backbone,
-            use_lora=use_lora,
-        )
-
-        # Progressive decoder
-        self.decoder = ProgressiveDecoder(encoder_dim=encoder_dim)
+        if use_dpt_fpn:
+            # Multi-layer encoder → DPT neck → FPN decoder
+            self.encoder = DinoMultiLayerEncoder(
+                backbone=self.backbone,
+                extract_layers=extract_layers,
+                freeze_backbone=freeze_backbone,
+                use_lora=use_lora,
+            )
+            self.neck = DPTReassembleNeck(
+                in_ch=DINOV3_FEATURE_DIM,
+                out_ch=neck_channels,
+                layers=extract_layers,
+            )
+            self.decoder = FPNDecoder(channels=neck_channels)
+            self.extract_layers = list(extract_layers)
+        else:
+            # Single-layer encoder → SimpleSegHead (DINOv3-IML style)
+            self.encoder = DinoSingleLayerEncoder(
+                backbone=self.backbone,
+                last_layer_idx=last_layer_idx,
+                freeze_backbone=freeze_backbone,
+                use_lora=use_lora,
+            )
+            self.decoder = SimpleSegHead(feat_dim=DINOV3_FEATURE_DIM)
+            self.neck = None
+            self.extract_layers = []
 
     def forward(self, clip: torch.Tensor) -> torch.Tensor:
         if clip.ndim != 5:
@@ -422,15 +410,27 @@ class DINOv3ViTL16InpaintingDetector(nn.Module):
         if channels != 3:
             raise ValueError(f"clip channel dimension must be 3, got {channels}")
 
-        # 1. Multi-layer encoder → [B, T, encoder_dim, h, w]
-        encoder_features = self.encoder(clip)
+        if self.use_dpt_fpn:
+            # Multi-layer encoder → {layer: [B, T, 1024, 32, 32]}
+            multi_feats = self.encoder(clip)
 
-        # 2. Decode per frame
-        logits_list: list[torch.Tensor] = []
-        for t in range(num_frames):
-            enc_t = encoder_features[:, t]  # [B, encoder_dim, h, w]
-            logits = self.decoder(enc_t)    # [B, 1, H, W]
-            logits_list.append(logits)
+            # Decode per-frame through neck + FPN
+            logits_list: list[torch.Tensor] = []
+            for t in range(num_frames):
+                # Gather features for frame t: {layer: [B, 1024, 32, 32]}
+                frame_feats = {k: v[:, t] for k, v in multi_feats.items()}
+                pyramid = self.neck(frame_feats)  # {"p2": [B,256,128,128], ...}
+                logits = self.decoder(pyramid)     # [B, 1, 512, 512]
+                logits_list.append(logits)
+        else:
+            # Single-layer encoder → [B, T, 1024, H/16, W/16]
+            encoder_features = self.encoder(clip)
+
+            logits_list = []
+            for t in range(num_frames):
+                enc_t = encoder_features[:, t]  # [B, 1024, h, w]
+                logits = self.decoder(enc_t)    # [B, 1, H, W]
+                logits_list.append(logits)
 
         return torch.stack(logits_list, dim=1)  # [B, T, 1, H, W]
 
@@ -466,17 +466,6 @@ def validate_config(cfg: dict[str, Any], mode: str) -> None:
         errors.append(f"checkpoint does not exist: {cfg['checkpoint']}")
     if int(cfg.get("lora_rank", 0)) < 0:
         errors.append("lora_rank must be >= 0")
-    if int(cfg.get("encoder_dim", 0)) <= 0:
-        errors.append("encoder_dim must be > 0")
-    if int(cfg.get("encoder_dim", 0)) % 16 != 0:
-        errors.append("encoder_dim should be divisible by 16 (GroupNorm-friendly)")
-    selected = cfg.get("selected_layers")
-    if not selected or not isinstance(selected, (list, tuple)):
-        errors.append(f"selected_layers must be a non-empty list, got {selected}")
-    else:
-        for idx in selected:
-            if not isinstance(idx, int) or idx < 0 or idx > 23:
-                errors.append(f"selected_layers entry {idx} is out of range [0, 23] for ViT-L/24")
 
     if errors:
         raise ValueError("Config validation failed:\n  - " + "\n  - ".join(errors))
@@ -493,55 +482,78 @@ def validate_config(cfg: dict[str, Any], mode: str) -> None:
 def build_model(cfg: dict[str, Any], device: torch.device, base_dir: Path) -> DINOv3ViTL16InpaintingDetector:
     backbone = load_dinov3_backbone(cfg, base_dir)
     lora_targets = tuple(str(item).strip() for item in str(cfg.get("lora_targets", "attn.qkv,attn.proj")).split(",") if str(item).strip())
+
+    use_dpt_fpn = bool(cfg.get("use_dpt_fpn", False))
+    extract_layers_str = cfg.get("extract_layers", "5,11,17,23")
+    if isinstance(extract_layers_str, (list, tuple)):
+        extract_layers = tuple(int(x) for x in extract_layers_str)
+    else:
+        extract_layers = tuple(int(x.strip()) for x in str(extract_layers_str).split(",") if x.strip())
+    neck_channels = int(cfg.get("neck_channels", 256))
+    lora_block_indices = parse_lora_layers(cfg.get("lora_layers", "all"))
+
     model = DINOv3ViTL16InpaintingDetector(
         backbone=backbone,
-        selected_layers=[int(x) for x in cfg.get("selected_layers", [5, 11, 17, 23])],
-        encoder_dim=int(cfg.get("encoder_dim", 256)),
-        decoder_channels=int(cfg.get("decoder_channels", 256)),
         freeze_backbone=bool(cfg.get("freeze_backbone", True)),
         use_lora=bool(cfg.get("use_lora", False)),
         lora_rank=int(cfg.get("lora_rank", 4)),
         lora_alpha=float(cfg.get("lora_alpha", 8.0)),
         lora_dropout=float(cfg.get("lora_dropout", 0.0)),
         lora_targets=lora_targets,
+        use_dpt_fpn=use_dpt_fpn,
+        extract_layers=extract_layers,
+        neck_channels=neck_channels,
+        lora_block_indices=lora_block_indices,
     )
 
     checkpoint = cfg.get("checkpoint", "")
     if checkpoint:
         state = torch.load(checkpoint, map_location="cpu")
-        model.load_state_dict(state["model"] if isinstance(state, dict) and "model" in state else state)
+        state_dict = state["model"] if isinstance(state, dict) and "model" in state else state
+        missing, unexpected = model.load_state_dict(state_dict, strict=False)
+        if missing:
+            print(f"[checkpoint] missing keys ({len(missing)}): "
+                  f"{missing[:5]}{'...' if len(missing) > 5 else ''}")
+        if unexpected:
+            print(f"[checkpoint] unexpected keys ({len(unexpected)}): "
+                  f"{unexpected[:5]}{'...' if len(unexpected) > 5 else ''}")
         print(f"[checkpoint] loaded: {checkpoint}")
 
     total, trainable = count_parameters(model)
-    selected = cfg.get("selected_layers", [5, 11, 17, 23])
-    print(f"[model] DINOv3 ViT-L/16 multi-layer encoder, layers={list(selected)}, "
-          f"LoRA layers: {model.lora_layers}")
+    tag = "DPT+FPN" if use_dpt_fpn else "single-layer"
+    print(f"[model] DINOv3 ViT-L/16 {tag} encoder, LoRA layers: {model.lora_layers}")
     print(f"[params] total {total:,} trainable {trainable:,}")
     return model.to(device)
 
 
-LOG_FIELDS = [
-    "epoch",
-    "lr",
-    "train_loss",
-    "train_bce_loss",
-    "train_focal_loss",
-    "train_iou_loss",
-    "train_iou",
-    "train_f1",
-    "train_precision",
-    "train_recall",
-    "train_accuracy",
-    "val_loss",
-    "val_bce_loss",
-    "val_focal_loss",
-    "val_iou_loss",
-    "val_iou",
-    "val_f1",
-    "val_precision",
-    "val_recall",
-    "val_accuracy",
-]
+# ── Helpers: logging (dynamic loss keys) ────────────────────────────────────
+
+METRIC_KEYS = ["iou", "f1", "precision", "recall", "accuracy"]
+
+
+def build_log_fields(active_loss_names: list[str]) -> list[str]:
+    """Build LOG_FIELDS list dynamically from active loss names."""
+    fields = ["epoch", "lr", "train_loss"]
+    for name in active_loss_names:
+        fields.append(f"train_{name}_loss")
+    for key in METRIC_KEYS:
+        fields.append(f"train_{key}")
+    fields.append("val_loss")
+    for name in active_loss_names:
+        fields.append(f"val_{name}_loss")
+    for key in METRIC_KEYS:
+        fields.append(f"val_{key}")
+    return fields
+
+
+def build_meters(active_loss_names: list[str]) -> dict[str, AverageMeter]:
+    """Build meters dict dynamically from active loss names."""
+    meters = {"loss": AverageMeter()}
+    for name in active_loss_names:
+        meters[f"{name}_loss"] = AverageMeter()
+    for key in METRIC_KEYS:
+        meters[key] = AverageMeter()
+    return meters
 
 
 def summarize_samples(value: Any) -> str:
@@ -549,17 +561,19 @@ def summarize_samples(value: Any) -> str:
     return ";".join(Path(path).name for path in paths)
 
 
-def init_training_log(path: Path, cfg: dict[str, Any], model: nn.Module) -> None:
+def init_training_log(path: Path, cfg: dict[str, Any], model: nn.Module, criterion: SegmentationLoss) -> None:
     total, trainable = count_parameters(model)
+    log_fields = build_log_fields(criterion.active_names)
+    loss_summary = " + ".join(f"{cfg.get('loss', {}).get(name, {}).get('weight', 1.0):.1f}*{name}" for name in criterion.active_names)
     lines = [
         f"# model={DINOV3_MODEL_NAME} use_lora={bool(cfg.get('use_lora', False))} "
         f"lora_rank={int(cfg.get('lora_rank', 4))} input_size={int(cfg.get('input_size', 0))} "
-        f"num_frames={int(cfg.get('num_frames', 0))}",
+        f"num_frames={int(cfg.get('num_frames', 0))} loss={loss_summary}",
         f"# train_samples={summarize_samples(cfg.get('train_samples', ''))} "
         f"val_samples={summarize_samples(cfg.get('val_samples', ''))}",
         f"# batch_size={int(cfg.get('batch_size', 0))} lr={float(cfg.get('learning_rate', 0.0))} "
         f"params_total={total} params_trainable={trainable}",
-        ",".join(LOG_FIELDS),
+        ",".join(log_fields),
     ]
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
@@ -577,15 +591,16 @@ def append_epoch_log(
     epoch: int,
     lr: float,
     train_metrics: dict[str, float],
+    log_fields: list[str],
     val_metrics: dict[str, float] | None = None,
 ) -> None:
     row_values: dict[str, float | int | None] = {"epoch": epoch, "lr": lr}
-    for key in ["loss", "bce_loss", "focal_loss", "iou_loss", "iou", "f1", "precision", "recall", "accuracy"]:
+    for key in ["loss"] + METRIC_KEYS + [name for name in train_metrics if name.endswith("_loss") and name != "loss"]:
         row_values[f"train_{key}"] = train_metrics.get(key)
         row_values[f"val_{key}"] = val_metrics.get(key) if val_metrics is not None else None
 
     with open(path, "a", encoding="utf-8") as f:
-        f.write(",".join(format_log_value(row_values.get(field)) for field in LOG_FIELDS) + "\n")
+        f.write(",".join(format_log_value(row_values.get(field)) for field in log_fields) + "\n")
 
 
 def forward_in_frame_chunks(model: nn.Module, frames: torch.Tensor, frame_chunk: int) -> torch.Tensor:
@@ -615,10 +630,7 @@ def run_epoch(
     is_train = mode == "train"
     model.train(is_train)
 
-    meters = {
-        key: AverageMeter()
-        for key in ["loss", "bce_loss", "focal_loss", "iou_loss", "iou", "f1", "precision", "recall", "accuracy"]
-    }
+    meters = build_meters(criterion.active_names)
 
     if is_train:
         if optimizer is None:
@@ -674,11 +686,27 @@ def train(cfg: dict[str, Any], device: torch.device, base_dir: Path) -> None:
         json.dump(cfg, f, indent=2, ensure_ascii=False)
 
     model = build_model(cfg, device, base_dir)
+    criterion = SegmentationLoss(loss_cfg=cfg.get("loss", {}))
+    log_fields = build_log_fields(criterion.active_names)
     log_path = save_dir / "log.txt"
-    init_training_log(log_path, cfg, model)
-    print(f"[log] writing training metrics to {log_path}")
 
-    criterion = SegmentationLoss()
+    # ── resume detection ─────────────────────────────────────────────────
+    checkpoint_path = cfg.get("checkpoint", "")
+    resume_epoch = 0
+    best_iou = -1.0
+
+    if checkpoint_path and Path(checkpoint_path).exists():
+        state = torch.load(checkpoint_path, map_location="cpu")
+        if isinstance(state, dict):
+            resume_epoch = state.get("epoch", 0)
+            best_iou = state.get("metrics", {}).get("iou", -1.0)
+
+    if log_path.exists() and resume_epoch > 0:
+        print(f"[log] resuming — appending to {log_path} (epoch {resume_epoch}, best_iou={best_iou:.4f})")
+    else:
+        init_training_log(log_path, cfg, model, criterion)
+        print(f"[log] writing training metrics to {log_path}")
+    print(f"[loss] active: {criterion.active_names}")
     trainable_params = [param for param in model.parameters() if param.requires_grad]
     if not trainable_params:
         raise RuntimeError("No trainable parameters. Enable decoder training or LoRA.")
@@ -689,14 +717,65 @@ def train(cfg: dict[str, Any], device: torch.device, base_dir: Path) -> None:
         weight_decay=float(cfg.get("weight_decay", 0.0)),
         betas=(0.9, 0.999),
     )
-    scheduler = ReduceLROnPlateau(optimizer, patience=5, factor=0.5, mode="max")
+    # ── LR scheduler ──────────────────────────────────────────────────────
+    scheduler_type = str(cfg.get("scheduler", "cosine")).strip().lower()
+    max_epochs = int(cfg["n_epochs"])
+    warmup_epochs = int(cfg.get("warmup_epochs", 10))
+    min_lr = float(cfg.get("min_lr", 1e-6))
+
+    if scheduler_type == "plateau":
+        scheduler = ReduceLROnPlateau(
+            optimizer,
+            mode="max",
+            factor=0.5,
+            patience=int(cfg.get("plateau_patience", 5)),
+            threshold=float(cfg.get("plateau_threshold", 0.003)),
+            threshold_mode="abs",
+            cooldown=int(cfg.get("plateau_cooldown", 1)),
+            min_lr=min_lr,
+        )
+        scheduler_step_on_val = True   # plateau needs val_iou
+
+    elif scheduler_type == "cosine":
+        warmup_scheduler = LinearLR(
+            optimizer, start_factor=0.1, end_factor=1.0, total_iters=warmup_epochs,
+        )
+        cosine_scheduler = CosineAnnealingLR(
+            optimizer, T_max=max_epochs - warmup_epochs, eta_min=min_lr,
+        )
+        scheduler = SequentialLR(
+            optimizer,
+            schedulers=[warmup_scheduler, cosine_scheduler],
+            milestones=[warmup_epochs],
+        )
+        scheduler_step_on_val = False  # cosine steps every epoch, no val_iou
+
+    else:
+        raise ValueError(f"Unknown scheduler type '{scheduler_type}'. Use 'cosine' or 'plateau'.")
+
+    print(f"[scheduler] type={scheduler_type} warmup_epochs={warmup_epochs} min_lr={min_lr}")
+    if scheduler_type == "plateau":
+        print(f"[scheduler] plateau: patience={int(cfg.get('plateau_patience', 5))} "
+              f"threshold={float(cfg.get('plateau_threshold', 0.003))} "
+              f"cooldown={int(cfg.get('plateau_cooldown', 1))}")
+
+    # ── restore optimizer & scheduler state from checkpoint ──────────────
+    if checkpoint_path and Path(checkpoint_path).exists() and resume_epoch > 0:
+        state = torch.load(checkpoint_path, map_location=device)
+        if isinstance(state, dict) and "optimizer" in state:
+            optimizer.load_state_dict(state["optimizer"])
+            print(f"[resume] optimizer state restored (epoch {resume_epoch})")
+        if isinstance(state, dict) and "scheduler" in state:
+            scheduler.load_state_dict(state["scheduler"])
+            print(f"[resume] scheduler state restored")
+
     scaler = torch.cuda.amp.GradScaler(enabled=bool(cfg.get("amp", True)) and device.type == "cuda")
 
     train_loader = make_loader(cfg, "train")
     val_loader = make_loader(cfg, "val")
 
-    best_iou = -1.0
-    for epoch in range(1, int(cfg["n_epochs"]) + 1):
+    start_epoch = resume_epoch + 1
+    for epoch in range(start_epoch, int(cfg["n_epochs"]) + 1):
         train_metrics = run_epoch(
             model,
             train_loader,
@@ -707,7 +786,7 @@ def train(cfg: dict[str, Any], device: torch.device, base_dir: Path) -> None:
             scaler=scaler,
             amp=bool(cfg.get("amp", True)),
             threshold=float(cfg.get("threshold", 0.5)),
-            grad_accum_steps=int(cfg.get("grad_accum_steps", 1)),
+            # grad_accum_steps=int(cfg.get("grad_accum_steps", 1)),
         )
         print(
             f"[epoch {epoch}] train loss {train_metrics['loss']:.4f} "
@@ -725,28 +804,46 @@ def train(cfg: dict[str, Any], device: torch.device, base_dir: Path) -> None:
                     "val",
                     amp=False,
                     threshold=float(cfg.get("threshold", 0.5)),
-                    eval_frame_chunk=int(cfg.get("eval_frame_chunk", 1)),
+                    # eval_frame_chunk=int(cfg.get("eval_frame_chunk", 1)),
                 )
-            scheduler.step(val_metrics["iou"])
             print(
                 f"[epoch {epoch}] val loss {val_metrics['loss']:.4f} "
                 f"f1 {val_metrics['f1']:.4f} iou {val_metrics['iou']:.4f}"
             )
 
-            save_checkpoint(save_dir / "latest.pt", model, optimizer, epoch, val_metrics)
+            # Save checkpoint with scheduler state
+            checkpoint_dict = {
+                "epoch": epoch,
+                "model": model.state_dict(),
+                "optimizer": optimizer.state_dict(),
+                "scheduler": scheduler.state_dict(),
+                "metrics": val_metrics,
+            }
+            torch.save(checkpoint_dict, save_dir / "latest.pt")
+
             if val_metrics["iou"] > best_iou:
                 best_iou = val_metrics["iou"]
-                save_checkpoint(save_dir / "best_iou.pt", model, optimizer, epoch, val_metrics)
+                torch.save(checkpoint_dict, save_dir / "best_iou.pt")
                 print(f"[checkpoint] best_iou updated: {best_iou:.4f}")
 
-        append_epoch_log(log_path, epoch, optimizer.param_groups[0]["lr"], train_metrics, val_metrics)
+            # Plateau scheduler: step with val_iou (only on validation epochs)
+            if scheduler_step_on_val:
+                scheduler.step(val_metrics["iou"])
+
+        # Cosine scheduler: step every epoch without val_iou
+        if not scheduler_step_on_val:
+            scheduler.step()
+
+        append_epoch_log(log_path, epoch, optimizer.param_groups[0]["lr"], train_metrics, log_fields, val_metrics)
 
 
-def evaluate(cfg: dict[str, Any], device: torch.device, mode: str, base_dir: Path) -> None:
+def evaluate(cfg: dict[str, Any], device: torch.device, mode: str, base_dir: Path, *, test_subset: str = "") -> dict[str, float]:
     model = build_model(cfg, device, base_dir)
-    criterion = SegmentationLoss()
+    criterion = SegmentationLoss(loss_cfg=cfg.get("loss", {}))
     loader = make_loader(cfg, mode)
     vis_dir = Path(cfg["visualization_dir"]) / mode if cfg.get("visualization_dir") else None
+    if test_subset and vis_dir:
+        vis_dir = vis_dir / test_subset
 
     with torch.no_grad():
         metrics = run_epoch(
@@ -758,13 +855,80 @@ def evaluate(cfg: dict[str, Any], device: torch.device, mode: str, base_dir: Pat
             amp=False,
             threshold=float(cfg.get("threshold", 0.5)),
             visualization_dir=vis_dir,
-            eval_frame_chunk=int(cfg.get("eval_frame_chunk", 1)),
         )
+    tag = f"[{mode}]" if not test_subset else f"[{mode}/{test_subset}]"
     print(
-        f"[{mode}] loss {metrics['loss']:.4f} "
+        f"{tag} loss {metrics['loss']:.4f} "
         f"f1 {metrics['f1']:.4f} iou {metrics['iou']:.4f} "
         f"precision {metrics['precision']:.4f} recall {metrics['recall']:.4f}"
     )
+    return metrics
+
+
+# ── predefined test-suite subsets ───────────────────────────────────────
+
+TEST_SUITE = [
+    {"key": "DVI_20",  "samples": "./flist/DAVIS-VI_val_DVI_20.npy"},
+    {"key": "CPNET_20", "samples": "./flist/DAVIS-VI_val_CPNET_20.npy"},
+    {"key": "OPN_20",  "samples": "./flist/DAVIS-VI_val_OPN_20.npy"},
+]
+
+
+def print_test_summary(
+    results: list[dict[str, Any]],
+    cfg: dict[str, Any],
+    checkpoint: str,
+) -> None:
+    """Print a formatted summary after running all test subsets."""
+
+    # ---- gather config info -----------------------------------------------
+    train_info = [Path(p).stem for p in split_path_list(cfg.get("train_samples", ""))]
+    decoder = "DPT+FPN" if bool(cfg.get("use_dpt_fpn", False)) else "ProgressiveDecoder"
+    lora_info = (
+        f"rank={int(cfg.get('lora_rank', 0))} alpha={float(cfg.get('lora_alpha', 0)):.0f}"
+        if bool(cfg.get("use_lora", False)) else "disabled"
+    )
+    loss_names = list(cfg.get("loss", {}).keys())
+    loss_str = " + ".join(
+        f"{cfg['loss'][n].get('weight', 1.0):.1f}*{n}" for n in loss_names if n != "loss"
+    ) or "default"
+
+    lines = []
+    lines.append("=" * 68)
+    lines.append("                     TEST SUITE SUMMARY")
+    lines.append("=" * 68)
+    lines.append(f"  Checkpoint       : {checkpoint}")
+    lines.append(f"  Decoder          : {decoder}")
+    lines.append(f"  LoRA             : {lora_info}")
+    lines.append(f"  DINO extract     : {cfg.get('extract_layers', '23')}")
+    lines.append(f"  Loss             : {loss_str}")
+    lines.append(f"  Train datasets   : {', '.join(train_info)}")
+    lines.append("-" * 68)
+
+    # ---- result table ----------------------------------------------------
+    header = f"  {'Test Set':<14s} {'IoU':>8s} {'F1':>8s} {'Precision':>10s} {'Recall':>8s} {'Loss':>8s}"
+    lines.append(header)
+    lines.append("  " + "-" * 58)
+
+    best_iou, best_name = -1.0, ""
+    for r in results:
+        name = r["subset"]
+        m = r["metrics"]
+        lines.append(
+            f"  {name:<14s} {m['iou']:8.4f} {m['f1']:8.4f} "
+            f"{m['precision']:10.4f} {m['recall']:8.4f} {m['loss']:8.4f}"
+        )
+        if m["iou"] > best_iou:
+            best_iou, best_name = m["iou"], name
+
+    lines.append("  " + "-" * 58)
+    avg_iou = sum(r["metrics"]["iou"] for r in results) / len(results)
+    avg_f1 = sum(r["metrics"]["f1"] for r in results) / len(results)
+    lines.append(f"  {'Average':<14s} {avg_iou:8.4f} {avg_f1:8.4f}")
+    lines.append(f"  Best: {best_name}  IoU={best_iou:.4f}")
+    lines.append("=" * 68)
+
+    print("\n".join(lines))
 
 
 def main() -> None:
@@ -786,15 +950,13 @@ def main() -> None:
     parser.add_argument("--n_epochs", type=int, default=None)
     parser.add_argument("--learning_rate", type=float, default=None)
     parser.add_argument("--weight_decay", type=float, default=None)
-    parser.add_argument("--decoder_channels", type=int, default=None)
-    parser.add_argument("--selected_layers", type=int, nargs="*", default=None)
-    parser.add_argument("--encoder_dim", type=int, default=None)
     parser.add_argument("--freeze_backbone", type=str2bool, default=None)
     parser.add_argument("--use_lora", type=str2bool, default=None)
     parser.add_argument("--lora_rank", type=int, default=None)
     parser.add_argument("--lora_alpha", type=float, default=None)
     parser.add_argument("--lora_dropout", type=float, default=None)
     parser.add_argument("--lora_targets", type=str, default=None)
+    parser.add_argument("--lora_layers", type=str, default=None)
     parser.add_argument("--save_dir", type=str, default=None)
     parser.add_argument("--visualization_dir", type=str, default=None)
     parser.add_argument("--device", type=str, default=None)
@@ -815,9 +977,7 @@ def main() -> None:
         "lora_alpha": 8.0,
         "lora_dropout": 0.0,
         "lora_targets": ",".join(DEFAULT_LORA_TARGETS),
-        "decoder_channels": 256,
-        "selected_layers": [5, 11, 17, 23],
-        "encoder_dim": 256,
+        "lora_layers": "all",
         "save_dir": "runs/dinov3_vitl16",
         "visualization_dir": "runs/dinov3_vitl16/vis",
         "checkpoint": "",
@@ -856,12 +1016,32 @@ def main() -> None:
     print(f"[device] {device} (gpu_id={gpu_id})")
     print(f"[mode] {mode}")
     print(f"[dinov3] model={DINOV3_MODEL_NAME} weights={cfg['dinov3_weights']}")
-    print(f"[dinov3] encoder: multi-layer, layers={cfg.get('selected_layers', [5, 11, 17, 23])}, "
-          f"encoder_dim={int(cfg.get('encoder_dim', 256))}")
+    decoder_tag = "DPT+FPN" if bool(cfg.get("use_dpt_fpn", False)) else "single-layer ProgressiveDecoder"
+    print(f"[dinov3] encoder: {decoder_tag}")
     print(f"[lora] enabled={bool(cfg.get('use_lora', False))} rank={int(cfg.get('lora_rank', 4))}")
 
     if mode == "train":
         train(cfg, device, base_dir)
+    elif mode == "test":
+        # Run all predefined test subsets sequentially
+        saved_test_samples = cfg.get("test_samples", None)
+        checkpoint = cfg.get("checkpoint", "")
+
+        results: list[dict[str, Any]] = []
+        for subset in TEST_SUITE:
+            # Replace test_samples for this subset
+            cfg["test_samples"] = subset["samples"]
+            print(f"\n{'─'*50}")
+            print(f"[test] running subset: {subset['key']}  ({subset['samples']})")
+            print(f"{'─'*50}")
+            metrics = evaluate(cfg, device, "test", base_dir, test_subset=subset["key"])
+            results.append({"subset": subset["key"], "metrics": dict(metrics)})
+
+        # Restore original test_samples (if any)
+        if saved_test_samples is not None:
+            cfg["test_samples"] = saved_test_samples
+
+        print_test_summary(results, cfg, checkpoint)
     else:
         evaluate(cfg, device, mode, base_dir)
 
