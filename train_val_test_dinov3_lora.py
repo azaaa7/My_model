@@ -419,10 +419,16 @@ class DINOv3ViTL16InpaintingDetector(nn.Module):
             if self.lora_layers == 0:
                 raise RuntimeError(f"No DINOv3 Linear layers matched LoRA targets: {lora_targets}")
 
-        # Freeze backbone (LoRA params remain trainable)
+        # Freeze backbone — BUT keep LoRA params trainable.
+        # LoRA params (lora_A, lora_B) are injected *before* this block;
+        # we must re-enable them after the blanket freeze.
         if freeze_backbone:
             for param in self.backbone.parameters():
                 param.requires_grad = False
+            if use_lora:
+                for name, param in self.backbone.named_parameters():
+                    if "lora_" in name:
+                        param.requires_grad = True
 
         if use_dpt_fpn:
             # Multi-layer encoder → DPT neck → FPN decoder
@@ -460,7 +466,9 @@ class DINOv3ViTL16InpaintingDetector(nn.Module):
             raise ValueError(f"clip channel dimension must be 3, got {channels}")
 
         if self.use_dpt_fpn:
-            P2, P3, P4, P5 = self.extract_fpn_features(clip)
+            # Flatten [B,T,3,H,W] → [B*T,3,H,W] before feature extraction
+            frames = clip.reshape(batch_size * num_frames, channels, height, width)
+            P2, P3, P4, P5 = self.extract_fpn_features(frames)
             logits = self.decode_fpn(P2, P3, P4, P5)
             logits = logits.reshape(batch_size, num_frames, 1, height, width)
             return logits
@@ -483,27 +491,24 @@ class DINOv3ViTL16InpaintingDetector(nn.Module):
     def extract_fpn_features(
         self, frames: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Extract multi-scale FPN feature pyramid for all frames at once.
+        """Extract multi-scale FPN feature pyramid for a batch of flat frames.
 
         Args:
-            frames: [B*T, 3, H, W]  (already normalised by encoder)
+            frames: [B, 3, H, W]  (flat batch, caller must flatten T/N dims)
 
         Returns:
-            P2: [B*T, 256, 128, 128]
-            P3: [B*T, 256,  64,  64]
-            P4: [B*T, 256,  32,  32]
-            P5: [B*T, 256,  16,  16]
+            P2: [B, 256, 128, 128]
+            P3: [B, 256,  64,  64]
+            P4: [B, 256,  32,  32]
+            P5: [B, 256,  16,  16]
         """
         if not self.use_dpt_fpn:
             raise RuntimeError(
                 "extract_fpn_features requires use_dpt_fpn=True"
             )
-        # Flatten T dim → [B*T, 3, H, W] and run multi-layer encoder
-        BxT = frames.shape[0]
-        # DinoMultiLayerEncoder expects [B, T, 3, H, W] but we only have
-        # flat frames.  Wrap with singleton T dim.
-        feats = self.encoder(frames[:, None])  # returns {layer: [B*T, 1, 1024, 32, 32]}
-        # Squeeze the singleton T dim
+        # DinoMultiLayerEncoder expects [B, T, 3, H, W]; pass flat frames
+        # with a singleton T dim then squeeze.
+        feats = self.encoder(frames[:, None])  # {layer: [B, 1, 1024, 32, 32]}
         feats_flat = {k: v[:, 0] for k, v in feats.items()}
         pyramid = self.neck(feats_flat)
         return pyramid["p2"], pyramid["p3"], pyramid["p4"], pyramid["p5"]
@@ -810,14 +815,26 @@ def run_epoch(
         batch_size = frames.shape[0]
         use_tfcu = frames.ndim == 6  # [B, N, T, C, H, W]
 
+        # TFCU mode: never chunk temporal dim — the adapter needs all frames.
+        _eval_chunk = 0 if use_tfcu else eval_frame_chunk
+
         with torch.set_grad_enabled(is_train):
             with torch.cuda.amp.autocast(enabled=amp and device.type == "cuda"):
-                logits_all = model(frames) if is_train else forward_in_frame_chunks(model, frames, eval_frame_chunk)
+                logits_all = model(frames) if is_train else forward_in_frame_chunks(model, frames, _eval_chunk)
 
                 if use_tfcu:
-                    # TFCU mode: logits and masks already have shape [B,N,T,1,H,W]
-                    logits = logits_all.reshape(-1, 1, logits_all.shape[-2], logits_all.shape[-1])
-                    loss_masks = masks.reshape(-1, 1, masks.shape[-2], masks.shape[-1])
+                    # TFCU mode: keep [B,N,T,1,H,W] so temporal losses
+                    # (temporal_delta, boundary) can access the T dimension.
+                    logits = logits_all
+                    loss_masks = masks
+                    # Align spatial dims (val masks may differ from 512×512)
+                    if logits.shape[-2:] != loss_masks.shape[-2:]:
+                        B_, N_, T_ = logits.shape[:3]
+                        logits = F.interpolate(
+                            logits.reshape(B_ * N_ * T_, 1, *logits.shape[-2:]),
+                            size=loss_masks.shape[-2:],
+                            mode="bilinear", align_corners=False,
+                        ).reshape(B_, N_, T_, 1, *loss_masks.shape[-2:])
                 else:
                     logits, loss_masks = align_logits_and_masks(logits_all, masks)
 
@@ -1195,6 +1212,7 @@ def main() -> None:
     parser.add_argument("--use_memory", type=str2bool, default=None)
     parser.add_argument("--detach_memory", type=str2bool, default=None)
     parser.add_argument("--use_spatial_pool", type=str2bool, default=None)
+    parser.add_argument("--encoder_chunk", type=int, default=None)
     parser.add_argument("--lr_temporal", type=float, default=None)
     parser.add_argument("--lr_decoder", type=float, default=None)
     parser.add_argument("--lr_lora", type=float, default=None)
@@ -1229,6 +1247,7 @@ def main() -> None:
         "use_memory": True,
         "detach_memory": True,
         "use_spatial_pool": False,
+        "encoder_chunk": 0,
         "lr_temporal": 1e-4,
         "lr_decoder": 1e-4,
         "lr_lora": 1e-5,

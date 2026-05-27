@@ -409,6 +409,17 @@ class SegmentationLoss(nn.Module):
         if logits.dim() == 3:
             logits = logits.unsqueeze(1)
 
+        # For pixel-wise losses (bce, dice, iou, edge, etc.) we flatten
+        # extra leading dims to 4-D [N, C, H, W].  BoundaryLoss and
+        # TemporalDeltaLoss handle their own shape logic internally.
+        _needs_4d = logits.dim() >= 5
+        if _needs_4d:
+            _logits_4d = logits.reshape(-1, logits.shape[-3], logits.shape[-2], logits.shape[-1])
+            _target_4d = target.reshape(-1, target.shape[-3], target.shape[-2], target.shape[-1])
+        else:
+            _logits_4d = logits
+            _target_4d = target
+
         total = torch.tensor(0.0, device=logits.device)
         items: dict[str, float] = {}
 
@@ -417,29 +428,35 @@ class SegmentationLoss(nn.Module):
 
             if name == "bce":
                 val = F.binary_cross_entropy_with_logits(
-                    logits.view(logits.size(0), -1),
-                    target.view(target.size(0), -1),
+                    _logits_4d.view(_logits_4d.size(0), -1),
+                    _target_4d.view(_target_4d.size(0), -1),
                 )
             elif name in ("focal",):
-                # FocalLoss internally handles sigmoid + BCE
-                val = module(logits.view(logits.size(0), -1), target.view(target.size(0), -1))
+                val = module(
+                    _logits_4d.view(_logits_4d.size(0), -1),
+                    _target_4d.view(_target_4d.size(0), -1),
+                )
             elif name == "iou":
-                probs = torch.sigmoid(logits)
-                val = module(probs, target)
+                probs = torch.sigmoid(_logits_4d)
+                val = module(probs, _target_4d)
             elif name == "tversky":
-                # TverskyLoss internally handles sigmoid
-                val = module(logits, target)
+                # TverskyLoss handles sigmoid + flatten(1) internally
+                val = module(_logits_4d, _target_4d)
             elif name == "edge":
-                # EdgeLoss internally handles sigmoid (BCEWithLogits)
-                val = module(logits, target)
+                val = module(_logits_4d, _target_4d)
+            elif name == "wbce":
+                val = module(_logits_4d, _target_4d)
+            elif name == "dice":
+                # DiceLoss handles sigmoid + flatten(1) internally
+                val = module(_logits_4d, _target_4d)
             elif name == "boundary":
-                # BoundaryLoss internally handles sigmoid
+                # BoundaryLoss needs original shape for its _flatten_extra_dims
                 val = module(logits, target)
             elif name == "temporal_delta":
-                # TemporalDeltaLoss internally handles sigmoid
+                # TemporalDeltaLoss needs [B,N,T,1,H,W] for T-dim diff
                 val = module(logits, target)
             else:
-                val = module(logits, target)
+                val = module(_logits_4d, _target_4d)
 
             total = total + weight * val
             items[f"{name}_loss"] = float(val.detach().cpu())

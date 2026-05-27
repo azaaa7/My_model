@@ -21,9 +21,14 @@ gt_ratio: 1
 # num_clips: clips per video sample (N dimension)
 # num_frames: frames per clip (T dimension)
 # In TFCU mode num_frames can be even (e.g. 4).
-num_clips: 4
+num_clips: 2
 num_frames: 4
 clip_stride: 1
+
+# encoder_chunk: max frames to process at once through DINOv3 ViT-L.
+# Smaller = lower VRAM peak.  0 = auto (all at once, risks OOM).
+# ViT-L @ 512: ~1.5 GiB/frame → chunk=2 limits peak to ~3 GiB.
+encoder_chunk: 1
 
 val_num_frames: 3
 dataset_repeat: 1
@@ -57,7 +62,8 @@ temporal_insert_level: P4
 memory_len: 4
 use_memory: true
 detach_memory: true
-use_spatial_pool: false
+# Pool spatial dims 32→16 before memory attention (saves VRAM).
+use_spatial_pool: true
 
 # ── Optimizer (per-component learning rates) ──────────────────────────────
 learning_rate: 1.0e-4

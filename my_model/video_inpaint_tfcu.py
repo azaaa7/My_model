@@ -57,6 +57,9 @@ class VideoInpaintTFCU(nn.Module):
         )
 
         self._input_size = int(cfg.get("input_size", 512))
+        # Encoder chunk size — process at most this many frames at once
+        # through DINOv3 to avoid OOM.  0 or negative = no chunking.
+        self._encoder_chunk = int(cfg.get("encoder_chunk", 0))
 
     # ------------------------------------------------------------------
     # Public API
@@ -99,13 +102,24 @@ class VideoInpaintTFCU(nn.Module):
                 f"Expected 5D or 6D input, got shape {tuple(video.shape)}"
             )
 
-        # ── flatten & extract FPN pyramid ────────────────────────────
+        # ── flatten & extract FPN pyramid (chunked for VRAM) ────────
         frames = video.reshape(B * N * T, C, H, W)       # [BNT, 3, H, W]
-        P2, P3, P4, P5 = self.extract_fpn_features(frames)
-        # P2: [BNT, 256, 128, 128]
-        # P3: [BNT, 256,  64,  64]
-        # P4: [BNT, 256,  32,  32]
-        # P5: [BNT, 256,  16,  16]
+        total_frames = frames.shape[0]
+        chunk = self._encoder_chunk if self._encoder_chunk > 0 else total_frames
+
+        P2_parts, P3_parts, P4_parts, P5_parts = [], [], [], []
+        for start in range(0, total_frames, chunk):
+            end = min(start + chunk, total_frames)
+            p2, p3, p4, p5 = self.extract_fpn_features(frames[start:end])
+            P2_parts.append(p2)
+            P3_parts.append(p3)
+            P4_parts.append(p4)
+            P5_parts.append(p5)
+
+        P2 = torch.cat(P2_parts, dim=0)   # [BNT, 256, 128, 128]
+        P3 = torch.cat(P3_parts, dim=0)   # [BNT, 256,  64,  64]
+        P4 = torch.cat(P4_parts, dim=0)   # [BNT, 256,  32,  32]
+        P5 = torch.cat(P5_parts, dim=0)   # [BNT, 256,  16,  16]
 
         # ── temporal adapter at P4 ───────────────────────────────────
         P4 = self.temporal_adapter(P4, B=B, N=N, T=T)
