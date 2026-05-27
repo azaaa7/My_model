@@ -108,6 +108,7 @@ def make_loader(cfg: dict[str, Any], mode: str):
         robust_jpeg_quality=cfg.get("robust_jpeg_quality", 0),
         num_clips=cfg.get("num_clips", 1),
         clip_stride=cfg.get("clip_stride", 1),
+        use_tfcu_adapter=cfg.get("use_tfcu_adapter", False),
     )
 
 

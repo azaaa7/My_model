@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import random
+import re
 from pathlib import Path
 from typing import List, Sequence, Tuple, Union
 
@@ -22,6 +23,18 @@ from .transforms import (
 
 
 SampleList = Union[str, os.PathLike[str], Sequence[str], Sequence[Sequence[str]], np.ndarray]
+
+
+def _numeric_key(path_or_name: str | os.PathLike[str]) -> int | str:
+    """Extract trailing integer from filename for correct numeric sort.
+
+    Ensures "10.png" follows "2.png" rather than string ordering.
+    """
+    name = Path(str(path_or_name)).stem
+    nums = re.findall(r"\d+", name)
+    if nums:
+        return int(nums[-1])
+    return name
 
 
 def _is_path_like(value: object) -> bool:
@@ -158,11 +171,16 @@ def _sample_multi_clip_indices(
     return clips
 
 
-def _validate_num_frames(num_frames: int) -> None:
+def _validate_num_frames(num_frames: int, *, allow_even: bool = False) -> None:
     if isinstance(num_frames, bool) or not isinstance(num_frames, int):
         raise TypeError(f"num_frames must be an int, got {type(num_frames).__name__}")
-    if num_frames <= 0 or num_frames % 2 == 0:
-        raise ValueError(f"num_frames must be a positive odd integer, got {num_frames}")
+    if num_frames <= 0:
+        raise ValueError(f"num_frames must be a positive integer, got {num_frames}")
+    if not allow_even and num_frames % 2 == 0:
+        raise ValueError(
+            f"num_frames must be a positive odd integer in baseline mode, got {num_frames}. "
+            f"Set use_tfcu_adapter=true or num_clips>1 to allow even frames."
+        )
 
 
 def _read_image(path: str) -> np.ndarray:
@@ -191,14 +209,14 @@ def _derive_sample_name(video_dir: str) -> str:
 
 class VideoInpaintingDataset(Dataset):
     """
-    可配置奇数帧输入的视频 inpainting 数据集。
+    可配置的视频 inpainting 数据集。
 
-    训练:
-        return frames, center_mask, H, W, name
-    验证:
-        return frames, all_masks, H, W, name  (等间隔 val_num_frames 帧)
-    测试 / 推理:
-        return frames, all_masks, H, W, name
+    模式 1 — Baseline (num_clips=1):
+        训练: return frames [T,3,H,W], center_mask [1,H,W], H, W, name
+        验证: return frames [T,3,H,W], all_masks [T,1,H,W], H, W, name
+
+    模式 2 — TFCU (num_clips>1):
+        训练/验证/测试: return frames [N,T,3,H,W], masks [N,T,1,H,W], H, W, name
     """
 
     def __init__(
@@ -215,8 +233,11 @@ class VideoInpaintingDataset(Dataset):
         robust_jpeg_quality: int = 0,
         num_clips: int = 1,
         clip_stride: int = 1,
+        use_tfcu_adapter: bool = False,
     ):
-        _validate_num_frames(num_frames)
+        self.use_tfcu_adapter = bool(use_tfcu_adapter)
+        allow_even = self.use_tfcu_adapter or num_clips > 1
+        _validate_num_frames(num_frames, allow_even=allow_even)
 
         self.samples = _load_samples(samples)
         self.mode = mode
@@ -243,8 +264,12 @@ class VideoInpaintingDataset(Dataset):
     def __getitem__(self, idx: int):
         idx = idx % len(self.samples)  # 支持 dataset_repeat：取模映射到原始样本
         video_dir, mask_dir = self.samples[idx]
-        frame_list = sorted([p for p in os.listdir(video_dir) if is_image_file(p)])
-        mask_list = sorted([p for p in os.listdir(mask_dir) if is_image_file(p)])
+        frame_list = sorted(
+            [p for p in os.listdir(video_dir) if is_image_file(p)], key=_numeric_key,
+        )
+        mask_list = sorted(
+            [p for p in os.listdir(mask_dir) if is_image_file(p)], key=_numeric_key,
+        )
 
         if len(frame_list) != len(mask_list):
             raise ValueError(
@@ -401,11 +426,12 @@ class VideoInpaintingDataset(Dataset):
         frames_out = torch.stack(all_frames, dim=0)   # [N, T, 3, H, W]
         masks_out = torch.stack(all_masks, dim=0)     # [N, T, 1, H, W]
 
+        # TFCU mode: always return full [N,T,*,*,*] masks for temporal loss
+        # Baseline mode (num_clips=1): return center-frame mask for training
+        if self.num_clips > 1:
+            return frames_out, masks_out, original_h, original_w, name
         if self.mode == "train":
-            # Return center-frame mask of center clip as single-mask target
-            # (align_logits_and_masks will handle the shape mismatch)
-            center_mask = masks_out[self.num_clips // 2, self.num_frames // 2]
-            return frames_out, center_mask, original_h, original_w, name
+            return frames_out, masks_out[self.num_frames // 2], original_h, original_w, name
         return frames_out, masks_out, original_h, original_w, name
 
 
@@ -419,6 +445,7 @@ def build_dataloader(
     drop_last: bool | None = None,
     num_clips: int = 1,
     clip_stride: int = 1,
+    use_tfcu_adapter: bool = False,
     **dataset_kwargs,
 ):
     dataset = VideoInpaintingDataset(
@@ -426,6 +453,7 @@ def build_dataloader(
         mode=mode,
         num_clips=num_clips,
         clip_stride=clip_stride,
+        use_tfcu_adapter=use_tfcu_adapter,
         **dataset_kwargs,
     )
     if shuffle is None:

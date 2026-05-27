@@ -22,7 +22,7 @@ gt_ratio: 1
 # num_frames: frames per clip (T dimension)
 # In TFCU mode num_frames can be even (e.g. 4).
 num_clips: 4
-num_frames: 3
+num_frames: 4
 clip_stride: 1
 
 val_num_frames: 3

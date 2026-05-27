@@ -530,6 +530,10 @@ class DINOv3ViTL16InpaintingDetector(nn.Module):
 
 def validate_config(cfg: dict[str, Any], mode: str) -> None:
     errors = []
+    use_tfcu = bool(cfg.get("use_tfcu_adapter", False))
+    num_frames = int(cfg.get("num_frames", 0))
+    num_clips = int(cfg.get("num_clips", 1))
+
     if mode not in {"train", "val", "test"}:
         errors.append(f"type must be train/val/test, got {mode}")
     if int(cfg.get("input_size", 0)) <= 0:
@@ -540,10 +544,15 @@ def validate_config(cfg: dict[str, Any], mode: str) -> None:
         errors.append("batch_size must be > 0")
     if int(cfg.get("grad_accum_steps", 1)) <= 0:
         errors.append("grad_accum_steps must be > 0")
-    if int(cfg.get("num_frames", 0)) <= 0:
-        errors.append("num_frames must be > 0")
-    elif not bool(cfg.get("use_tfcu_adapter", False)) and int(cfg.get("num_frames", 0)) % 2 == 0:
-        errors.append("num_frames must be a positive odd integer (unless use_tfcu_adapter=true)")
+
+    if use_tfcu:
+        if num_frames <= 0:
+            errors.append("num_frames must be positive in TFCU mode")
+        if num_clips <= 0:
+            errors.append("num_clips must be positive in TFCU mode")
+    else:
+        if num_frames <= 0 or num_frames % 2 == 0:
+            errors.append("num_frames must be a positive odd integer (or set use_tfcu_adapter=true)")
 
     required = ["val_samples"] if mode == "val" else ["test_samples"] if mode == "test" else ["train_samples", "val_samples"]
     for key in required:
@@ -799,11 +808,19 @@ def run_epoch(
     for step, batch in enumerate(loader, start=1):
         frames, masks = batch[0].to(device), batch[1].to(device)
         batch_size = frames.shape[0]
+        use_tfcu = frames.ndim == 6  # [B, N, T, C, H, W]
 
         with torch.set_grad_enabled(is_train):
             with torch.cuda.amp.autocast(enabled=amp and device.type == "cuda"):
                 logits_all = model(frames) if is_train else forward_in_frame_chunks(model, frames, eval_frame_chunk)
-                logits, loss_masks = align_logits_and_masks(logits_all, masks)
+
+                if use_tfcu:
+                    # TFCU mode: logits and masks already have shape [B,N,T,1,H,W]
+                    logits = logits_all.reshape(-1, 1, logits_all.shape[-2], logits_all.shape[-1])
+                    loss_masks = masks.reshape(-1, 1, masks.shape[-2], masks.shape[-1])
+                else:
+                    logits, loss_masks = align_logits_and_masks(logits_all, masks)
+
                 loss, loss_items = criterion(logits, loss_masks)
 
             if is_train:
