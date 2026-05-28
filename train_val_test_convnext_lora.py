@@ -111,6 +111,8 @@ def make_loader(cfg: dict[str, Any], mode: str):
         use_tfcu_adapter=cfg.get("use_tfcu_adapter", False),
         augment_prob=cfg.get("augment_prob", 0.75),
         test_max_clips=cfg.get("test_max_clips", 4),
+        val_full_video=cfg.get("val_full_video", False),
+        test_full_video=cfg.get("test_full_video", True),
     )
 
 

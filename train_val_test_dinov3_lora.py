@@ -894,7 +894,7 @@ def run_epoch(
                 else:
                     logits, loss_masks = align_logits_and_masks(logits_all, masks)
 
-                if mode == "test" and use_tfcu and valid_mask is not None:
+                if mode in ("val", "test") and use_tfcu and valid_mask is not None:
                     loss, loss_items = _criterion_on_valid_tfcu_frames(
                         criterion,
                         logits,
@@ -922,7 +922,7 @@ def run_epoch(
         metric_logits = logits.detach()
         metric_masks = loss_masks.detach()
         meter_weight = batch_size
-        if mode == "test" and use_tfcu and valid_mask is not None:
+        if mode in ("val", "test") and use_tfcu and valid_mask is not None:
             metric_logits, metric_masks = _valid_tfcu_frames(metric_logits, metric_masks, valid_mask)
             meter_weight = int(valid_mask.sum().item())
 
@@ -1285,6 +1285,8 @@ def main() -> None:
     parser.add_argument("--use_spatial_pool", type=str2bool, default=None)
     parser.add_argument("--encoder_chunk", type=int, default=None)
     parser.add_argument("--test_max_clips", type=int, default=None)
+    parser.add_argument("--val_full_video", type=str2bool, default=None)
+    parser.add_argument("--test_full_video", type=str2bool, default=None)
     parser.add_argument("--lr_temporal", type=float, default=None)
     parser.add_argument("--lr_decoder", type=float, default=None)
     parser.add_argument("--lr_lora", type=float, default=None)
@@ -1322,6 +1324,8 @@ def main() -> None:
         "use_spatial_pool": False,
         "encoder_chunk": 0,
         "test_max_clips": 4,
+        "val_full_video": False,
+        "test_full_video": True,
         "lr_temporal": 1e-4,
         "lr_decoder": 1e-4,
         "lr_lora": 1e-5,
@@ -1365,7 +1369,9 @@ def main() -> None:
         print(f"[tfcu] adapter enabled  num_clips={int(cfg.get('num_clips', 4))} "
               f"num_frames={int(cfg.get('num_frames', 1))} "
               f"memory_len={int(cfg.get('memory_len', 4))} "
-              f"use_memory={bool(cfg.get('use_memory', True))}")
+              f"use_memory={bool(cfg.get('use_memory', True))} "
+              f"val_full_video={bool(cfg.get('val_full_video', False))} "
+              f"test_full_video={bool(cfg.get('test_full_video', True))}")
 
     if mode == "train":
         train(cfg, device, base_dir)

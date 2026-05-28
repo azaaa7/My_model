@@ -44,6 +44,11 @@ augment_prob: 0.75
 # Caps auto-expanded num_clips to avoid OOM (e.g. N=4 → 16 frames at T=4).
 test_max_clips: 4
 
+# Full-video eval: split each val/test video into sequential windows and
+# filter padding frames with valid_mask.  Keep val false for fast validation.
+val_full_video: false
+test_full_video: true
+
 # ── DINOv3 backbone ──────────────────────────────────────────────────────
 dinov3_weights: "./runs/dinov3_vitl16/dinov3_vitl16_pretrain_lvd1689m-8aa4cbdd.pth"
 dinov3_repo: "./dinov3"

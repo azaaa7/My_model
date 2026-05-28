@@ -171,13 +171,13 @@ def _sample_multi_clip_indices(
     return clips
 
 
-def _sample_test_windows(
+def _sample_eval_windows(
     video_length: int,
     num_clips: int,
     num_frames: int,
     stride: int = 1,
 ) -> list[dict[str, list[list[int]] | list[list[bool]]]]:
-    """Build sequential fixed-size windows for test-time inference."""
+    """Build sequential fixed-size windows for eval-time inference."""
     assert video_length > 0
     assert num_clips > 0
     assert num_frames > 0
@@ -218,6 +218,9 @@ def _sample_test_windows(
         })
 
     return windows
+
+
+_sample_test_windows = _sample_eval_windows
 
 
 def _validate_num_frames(num_frames: int, *, allow_even: bool = False) -> None:
@@ -284,6 +287,8 @@ class VideoInpaintingDataset(Dataset):
         clip_stride: int = 1,
         use_tfcu_adapter: bool = False,
         test_max_clips: int = 4,
+        val_full_video: bool = False,
+        test_full_video: bool = True,
     ):
         self.use_tfcu_adapter = bool(use_tfcu_adapter)
         allow_even = self.use_tfcu_adapter or num_clips > 1
@@ -302,6 +307,15 @@ class VideoInpaintingDataset(Dataset):
         self.num_clips = num_clips
         self.clip_stride = clip_stride
         self.test_max_clips = test_max_clips
+        self.val_full_video = bool(val_full_video)
+        self.test_full_video = bool(test_full_video)
+        self.use_eval_windows = (
+            self.num_clips > 1
+            and (
+                (self.mode == "val" and self.val_full_video)
+                or (self.mode == "test" and self.test_full_video)
+            )
+        )
 
         self.to_tensor = transforms.Compose([
             np.float32,
@@ -310,7 +324,7 @@ class VideoInpaintingDataset(Dataset):
         self.replay_aug = build_replay_augmenter()
         self.eval_items: list[dict[str, object]] | None = None
 
-        if self.mode == "test" and self.num_clips > 1:
+        if self.use_eval_windows:
             self.eval_items = []
             for sample_idx, (video_dir, _mask_dir) in enumerate(self.samples):
                 frame_list = sorted(
@@ -321,7 +335,7 @@ class VideoInpaintingDataset(Dataset):
                 if video_length <= 0:
                     continue
 
-                windows = _sample_test_windows(
+                windows = _sample_eval_windows(
                     video_length=video_length,
                     num_clips=self.num_clips,
                     num_frames=self.num_frames,
@@ -340,12 +354,12 @@ class VideoInpaintingDataset(Dataset):
                     })
 
     def __len__(self) -> int:
-        if self.mode == "test" and self.num_clips > 1 and self.eval_items is not None:
+        if self.use_eval_windows and self.eval_items is not None:
             return len(self.eval_items)
         return len(self.samples) * self.dataset_repeat
 
     def __getitem__(self, idx: int):
-        if self.mode == "test" and self.num_clips > 1 and self.eval_items is not None:
+        if self.use_eval_windows and self.eval_items is not None:
             item = self.eval_items[idx]
             sample_idx = int(item["sample_idx"])
             video_dir, mask_dir = self.samples[sample_idx]
@@ -475,7 +489,7 @@ class VideoInpaintingDataset(Dataset):
         valid_mask,
         is_last_window: bool,
     ):
-        """Load a fixed test window without re-sampling clip indices."""
+        """Load a fixed eval window without re-sampling clip indices."""
         all_frames: list[torch.Tensor] = []
         all_masks: list[torch.Tensor] = []
         original_h, original_w = None, None
@@ -499,9 +513,9 @@ class VideoInpaintingDataset(Dataset):
                 frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
                 masks.append(mask)
 
-            if self.robust_noise_snr > 0:
+            if self.mode == "test" and self.robust_noise_snr > 0:
                 frames = [add_gaussian_noise_snr(img, self.robust_noise_snr) for img in frames]
-            if 1 <= self.robust_jpeg_quality <= 100:
+            if self.mode == "test" and 1 <= self.robust_jpeg_quality <= 100:
                 frames = [simulate_jpeg_compression_cv2(img, self.robust_jpeg_quality) for img in frames]
 
             frame_tensors = []
@@ -639,6 +653,8 @@ def build_dataloader(
     clip_stride: int = 1,
     use_tfcu_adapter: bool = False,
     test_max_clips: int = 4,
+    val_full_video: bool = False,
+    test_full_video: bool = True,
     **dataset_kwargs,
 ):
     dataset = VideoInpaintingDataset(
@@ -648,6 +664,8 @@ def build_dataloader(
         clip_stride=clip_stride,
         use_tfcu_adapter=use_tfcu_adapter,
         test_max_clips=test_max_clips,
+        val_full_video=val_full_video,
+        test_full_video=test_full_video,
         **dataset_kwargs,
     )
     if shuffle is None:
