@@ -786,6 +786,52 @@ def forward_in_frame_chunks(model: nn.Module, frames: torch.Tensor, frame_chunk:
     return model(frames)
 
 
+def _valid_tfcu_frames(
+    logits: torch.Tensor,
+    masks: torch.Tensor,
+    valid_mask: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    valid = valid_mask.bool()
+    if not bool(valid.any().item()):
+        raise ValueError("valid_mask contains no real frames")
+    return logits[valid], masks[valid]
+
+
+def _criterion_on_valid_tfcu_frames(
+    criterion: SegmentationLoss,
+    logits: torch.Tensor,
+    masks: torch.Tensor,
+    valid_mask: torch.Tensor,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    valid = valid_mask.bool()
+    if not bool(valid.any().item()):
+        raise ValueError("valid_mask contains no real frames")
+
+    total_weight = 0
+    total_loss = logits.new_tensor(0.0)
+    item_totals: dict[str, float] = {}
+
+    for batch_idx in range(logits.shape[0]):
+        sample_valid = valid[batch_idx]
+        weight = int(sample_valid.sum().item())
+        if weight <= 0:
+            continue
+
+        sample_logits = logits[batch_idx][sample_valid].unsqueeze(0).unsqueeze(0)
+        sample_masks = masks[batch_idx][sample_valid].unsqueeze(0).unsqueeze(0)
+        sample_loss, sample_items = criterion(sample_logits, sample_masks)
+
+        total_loss = total_loss + sample_loss * weight
+        total_weight += weight
+        for key, value in sample_items.items():
+            item_totals[key] = item_totals.get(key, 0.0) + float(value) * weight
+
+    loss = total_loss / max(total_weight, 1)
+    items = {key: value / max(total_weight, 1) for key, value in item_totals.items()}
+    items["loss"] = float(loss.detach().cpu())
+    return loss, items
+
+
 def run_epoch(
     model: nn.Module,
     loader,
@@ -811,7 +857,17 @@ def run_epoch(
         optimizer.zero_grad(set_to_none=True)
 
     for step, batch in enumerate(loader, start=1):
-        frames, masks = batch[0].to(device), batch[1].to(device)
+        if isinstance(batch, dict):
+            frames = batch["images"].to(device)
+            masks = batch["masks"].to(device)
+            valid_mask = batch.get("valid_mask")
+            valid_mask = valid_mask.to(device) if valid_mask is not None else None
+            names = batch.get("name", batch.get("video_id", []))
+        else:
+            frames, masks = batch[0].to(device), batch[1].to(device)
+            valid_mask = None
+            names = batch[4] if len(batch) > 4 else []
+
         batch_size = frames.shape[0]
         use_tfcu = frames.ndim == 6  # [B, N, T, C, H, W]
 
@@ -838,7 +894,15 @@ def run_epoch(
                 else:
                     logits, loss_masks = align_logits_and_masks(logits_all, masks)
 
-                loss, loss_items = criterion(logits, loss_masks)
+                if mode == "test" and use_tfcu and valid_mask is not None:
+                    loss, loss_items = _criterion_on_valid_tfcu_frames(
+                        criterion,
+                        logits,
+                        loss_masks,
+                        valid_mask,
+                    )
+                else:
+                    loss, loss_items = criterion(logits, loss_masks)
 
             if is_train:
                 scaled_loss = loss / grad_accum_steps
@@ -855,12 +919,18 @@ def run_epoch(
                         optimizer.step()
                         optimizer.zero_grad(set_to_none=True)
 
-        metric_items = binary_metrics_from_logits(logits.detach(), loss_masks.detach(), threshold=threshold)
+        metric_logits = logits.detach()
+        metric_masks = loss_masks.detach()
+        meter_weight = batch_size
+        if mode == "test" and use_tfcu and valid_mask is not None:
+            metric_logits, metric_masks = _valid_tfcu_frames(metric_logits, metric_masks, valid_mask)
+            meter_weight = int(valid_mask.sum().item())
+
+        metric_items = binary_metrics_from_logits(metric_logits, metric_masks, threshold=threshold)
         for key, value in {**loss_items, **metric_items}.items():
-            meters[key].update(value, batch_size)
+            meters[key].update(value, meter_weight)
 
         if visualization_dir is not None and not is_train and step <= 50:
-            names = batch[4] if len(batch) > 4 else []
             save_visualization(frames, logits_all.detach(), masks, names, visualization_dir, threshold, max_items=frames.shape[0])
 
         if is_train and (step == 1 or step % 20 == 0):

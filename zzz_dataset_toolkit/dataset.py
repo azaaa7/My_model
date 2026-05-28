@@ -171,6 +171,55 @@ def _sample_multi_clip_indices(
     return clips
 
 
+def _sample_test_windows(
+    video_length: int,
+    num_clips: int,
+    num_frames: int,
+    stride: int = 1,
+) -> list[dict[str, list[list[int]] | list[list[bool]]]]:
+    """Build sequential fixed-size windows for test-time inference."""
+    assert video_length > 0
+    assert num_clips > 0
+    assert num_frames > 0
+    assert stride > 0
+
+    all_clips: list[list[int]] = []
+    all_valid: list[list[bool]] = []
+    step = num_frames * stride
+
+    for start in range(0, video_length, step):
+        clip: list[int] = []
+        valid: list[bool] = []
+
+        for i in range(num_frames):
+            idx = start + i * stride
+            if idx < video_length:
+                clip.append(idx)
+                valid.append(True)
+            else:
+                clip.append(video_length - 1)
+                valid.append(False)
+
+        all_clips.append(clip)
+        all_valid.append(valid)
+
+    windows: list[dict[str, list[list[int]] | list[list[bool]]]] = []
+    for i in range(0, len(all_clips), num_clips):
+        window = all_clips[i:i + num_clips]
+        valid_window = all_valid[i:i + num_clips]
+
+        while len(window) < num_clips:
+            window.append(window[-1])
+            valid_window.append([False] * num_frames)
+
+        windows.append({
+            "frame_indices": window,
+            "valid_mask": valid_window,
+        })
+
+    return windows
+
+
 def _validate_num_frames(num_frames: int, *, allow_even: bool = False) -> None:
     if isinstance(num_frames, bool) or not isinstance(num_frames, int):
         raise TypeError(f"num_frames must be an int, got {type(num_frames).__name__}")
@@ -259,11 +308,72 @@ class VideoInpaintingDataset(Dataset):
             transforms.ToTensor(),
         ])
         self.replay_aug = build_replay_augmenter()
+        self.eval_items: list[dict[str, object]] | None = None
+
+        if self.mode == "test" and self.num_clips > 1:
+            self.eval_items = []
+            for sample_idx, (video_dir, _mask_dir) in enumerate(self.samples):
+                frame_list = sorted(
+                    [p for p in os.listdir(video_dir) if is_image_file(p)],
+                    key=_numeric_key,
+                )
+                video_length = len(frame_list)
+                if video_length <= 0:
+                    continue
+
+                windows = _sample_test_windows(
+                    video_length=video_length,
+                    num_clips=self.num_clips,
+                    num_frames=self.num_frames,
+                    stride=self.clip_stride,
+                )
+                name = _derive_sample_name(video_dir)
+
+                for window_id, item in enumerate(windows):
+                    self.eval_items.append({
+                        "sample_idx": sample_idx,
+                        "video_id": name,
+                        "window_id": window_id,
+                        "frame_indices": item["frame_indices"],
+                        "valid_mask": item["valid_mask"],
+                        "is_last_window": window_id == len(windows) - 1,
+                    })
 
     def __len__(self) -> int:
+        if self.mode == "test" and self.num_clips > 1 and self.eval_items is not None:
+            return len(self.eval_items)
         return len(self.samples) * self.dataset_repeat
 
     def __getitem__(self, idx: int):
+        if self.mode == "test" and self.num_clips > 1 and self.eval_items is not None:
+            item = self.eval_items[idx]
+            sample_idx = int(item["sample_idx"])
+            video_dir, mask_dir = self.samples[sample_idx]
+            frame_list = sorted(
+                [p for p in os.listdir(video_dir) if is_image_file(p)], key=_numeric_key,
+            )
+            mask_list = sorted(
+                [p for p in os.listdir(mask_dir) if is_image_file(p)], key=_numeric_key,
+            )
+
+            if len(frame_list) != len(mask_list):
+                raise ValueError(
+                    f"Frame count and mask count mismatch in {video_dir}: "
+                    f"{len(frame_list)} vs {len(mask_list)}"
+                )
+
+            return self._get_multi_clip_by_indices(
+                video_dir=video_dir,
+                mask_dir=mask_dir,
+                frame_list=frame_list,
+                mask_list=mask_list,
+                clip_indices=item["frame_indices"],
+                video_id=str(item["video_id"]),
+                window_id=int(item["window_id"]),
+                valid_mask=item["valid_mask"],
+                is_last_window=bool(item["is_last_window"]),
+            )
+
         idx = idx % len(self.samples)  # 支持 dataset_repeat：取模映射到原始样本
         video_dir, mask_dir = self.samples[idx]
         frame_list = sorted(
@@ -352,6 +462,76 @@ class VideoInpaintingDataset(Dataset):
     # ------------------------------------------------------------------
     # Multi-clip sampling
     # ------------------------------------------------------------------
+
+    def _get_multi_clip_by_indices(
+        self,
+        video_dir: str,
+        mask_dir: str,
+        frame_list: list[str],
+        mask_list: list[str],
+        clip_indices,
+        video_id: str,
+        window_id: int,
+        valid_mask,
+        is_last_window: bool,
+    ):
+        """Load a fixed test window without re-sampling clip indices."""
+        all_frames: list[torch.Tensor] = []
+        all_masks: list[torch.Tensor] = []
+        original_h, original_w = None, None
+
+        for clip in clip_indices:
+            frames: list[np.ndarray] = []
+            masks: list[np.ndarray] = []
+
+            for frame_idx in clip:
+                frame_path = str(Path(video_dir) / frame_list[frame_idx])
+                mask_path = str(Path(mask_dir) / mask_list[frame_idx])
+
+                frame = _read_image(frame_path)
+                mask = _read_image(mask_path)
+                mask = _align_mask_to_frame(mask, frame)
+                mask = threshold_mask(mask)
+
+                if original_h is None:
+                    original_h, original_w = frame.shape[:2]
+
+                frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+                masks.append(mask)
+
+            if self.robust_noise_snr > 0:
+                frames = [add_gaussian_noise_snr(img, self.robust_noise_snr) for img in frames]
+            if 1 <= self.robust_jpeg_quality <= 100:
+                frames = [simulate_jpeg_compression_cv2(img, self.robust_jpeg_quality) for img in frames]
+
+            frame_tensors = []
+            mask_tensors = []
+            for img, mask in zip(frames, masks):
+                img = cv2.resize(img, (self.input_size, self.input_size))
+                img = img.astype(np.float32) / 255.0
+                mask = mask.astype(np.float32) / 255.0
+
+                frame_tensors.append(self.to_tensor(img).unsqueeze(0))
+                mask_tensors.append(torch.from_numpy(mask[:, :, :1]).float().permute(2, 0, 1).unsqueeze(0))
+
+            all_frames.append(torch.cat(frame_tensors, dim=0))
+            all_masks.append(torch.cat(mask_tensors, dim=0))
+
+        frames_out = torch.stack(all_frames, dim=0)
+        masks_out = torch.stack(all_masks, dim=0)
+
+        return {
+            "images": frames_out,
+            "masks": masks_out,
+            "video_id": video_id,
+            "window_id": window_id,
+            "frame_indices": torch.tensor(clip_indices, dtype=torch.long),
+            "valid_mask": torch.tensor(valid_mask, dtype=torch.bool),
+            "is_last_window": is_last_window,
+            "original_h": original_h,
+            "original_w": original_w,
+            "name": video_id,
+        }
 
     def _get_multi_clip(
         self,
