@@ -109,6 +109,8 @@ def make_loader(cfg: dict[str, Any], mode: str):
         num_clips=cfg.get("num_clips", 1),
         clip_stride=cfg.get("clip_stride", 1),
         use_tfcu_adapter=cfg.get("use_tfcu_adapter", False),
+        augment_prob=cfg.get("augment_prob", 0.75),
+        test_max_clips=cfg.get("test_max_clips", 4),
     )
 
 

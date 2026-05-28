@@ -234,6 +234,7 @@ class VideoInpaintingDataset(Dataset):
         num_clips: int = 1,
         clip_stride: int = 1,
         use_tfcu_adapter: bool = False,
+        test_max_clips: int = 4,
     ):
         self.use_tfcu_adapter = bool(use_tfcu_adapter)
         allow_even = self.use_tfcu_adapter or num_clips > 1
@@ -251,6 +252,7 @@ class VideoInpaintingDataset(Dataset):
         self.robust_jpeg_quality = robust_jpeg_quality
         self.num_clips = num_clips
         self.clip_stride = clip_stride
+        self.test_max_clips = test_max_clips
 
         self.to_tensor = transforms.Compose([
             np.float32,
@@ -360,11 +362,21 @@ class VideoInpaintingDataset(Dataset):
         video_length: int,
         name: str,
     ):
-        """Sample ``num_clips`` clips from the same video, chronologically ordered."""
+        """Sample ``num_clips`` clips from the same video, chronologically ordered.
+
+        Test mode: num_clips auto-expands to cover all frames, but capped at
+        ``test_max_clips`` to avoid OOM (default 4 = 16 frames at T=4).
+        """
+        actual_num_clips = self.num_clips
+        if self.mode in ("test", "val"):
+            max_clips = max(1, (video_length + self.num_frames - 1) // self.num_frames)
+            cap = getattr(self, "test_max_clips", self.num_clips)
+            actual_num_clips = min(max(self.num_clips, max_clips), cap)
+
         all_clip_indices = _sample_multi_clip_indices(
             video_length,
             self.mode,
-            num_clips=self.num_clips,
+            num_clips=actual_num_clips,
             num_frames=self.num_frames,
             stride=self.clip_stride,
         )
@@ -446,6 +458,7 @@ def build_dataloader(
     num_clips: int = 1,
     clip_stride: int = 1,
     use_tfcu_adapter: bool = False,
+    test_max_clips: int = 4,
     **dataset_kwargs,
 ):
     dataset = VideoInpaintingDataset(
@@ -454,6 +467,7 @@ def build_dataloader(
         num_clips=num_clips,
         clip_stride=clip_stride,
         use_tfcu_adapter=use_tfcu_adapter,
+        test_max_clips=test_max_clips,
         **dataset_kwargs,
     )
     if shuffle is None:

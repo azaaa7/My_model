@@ -6,9 +6,11 @@ type: train
 train_samples:
   - "./flist/DAVIS-VI_tra_DVI_30.npy"
   - "./flist/DAVIS-VI_tra_CPNET_30.npy"
+  # - "./flist/DAVIS-VI_tra_OPN_30.npy"
 val_samples:
   - "./flist/DAVIS-VI_val_DVI_20.npy"
   - "./flist/DAVIS-VI_val_CPNET_20.npy"
+# - "./flist/DAVIS-VI_val_OPN_20.npy"
 test_samples:
   - "./flist/DAVIS-VI_val_DVI_20.npy"
   - "./flist/DAVIS-VI_val_CPNET_20.npy"
@@ -35,6 +37,12 @@ dataset_repeat: 1
 batch_size: 1
 num_workers: 4
 grad_accum_steps: 8
+# augment_prob: data augmentation probability (0=off, 1=always).  Train mode only.
+augment_prob: 0.75
+
+# test_max_clips: max clips per sample in val/test mode.
+# Caps auto-expanded num_clips to avoid OOM (e.g. N=4 → 16 frames at T=4).
+test_max_clips: 4
 
 # ── DINOv3 backbone ──────────────────────────────────────────────────────
 dinov3_weights: "./runs/dinov3_vitl16/dinov3_vitl16_pretrain_lvd1689m-8aa4cbdd.pth"

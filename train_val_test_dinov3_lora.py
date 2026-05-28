@@ -1202,6 +1202,7 @@ def main() -> None:
     parser.add_argument("--lora_layers", type=str, default=None)
     parser.add_argument("--save_dir", type=str, default=None)
     parser.add_argument("--visualization_dir", type=str, default=None)
+    parser.add_argument("--augment_prob", type=float, default=None)
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--gpu_id", type=int, default=None)
     # TFCU adapter options
@@ -1213,6 +1214,7 @@ def main() -> None:
     parser.add_argument("--detach_memory", type=str2bool, default=None)
     parser.add_argument("--use_spatial_pool", type=str2bool, default=None)
     parser.add_argument("--encoder_chunk", type=int, default=None)
+    parser.add_argument("--test_max_clips", type=int, default=None)
     parser.add_argument("--lr_temporal", type=float, default=None)
     parser.add_argument("--lr_decoder", type=float, default=None)
     parser.add_argument("--lr_lora", type=float, default=None)
@@ -1239,6 +1241,7 @@ def main() -> None:
         "grad_accum_steps": 1,
         "eval_frame_chunk": 1,
         "gpu_id": 0,
+        "augment_prob": 0.75,
         # TFCU defaults
         "use_tfcu_adapter": False,
         "num_clips": 1,
@@ -1248,6 +1251,7 @@ def main() -> None:
         "detach_memory": True,
         "use_spatial_pool": False,
         "encoder_chunk": 0,
+        "test_max_clips": 4,
         "lr_temporal": 1e-4,
         "lr_decoder": 1e-4,
         "lr_lora": 1e-5,
