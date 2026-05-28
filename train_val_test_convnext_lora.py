@@ -303,8 +303,24 @@ def save_visualization(
     frames = frames.detach().cpu()
     target = target.detach().cpu()
 
+    # Determine if TFCU 6-D input [B, N, T, C, H, W]
+    is_tfcu = frames.ndim == 6
+
     for idx in range(min(frames.shape[0], max_items)):
-        if target.ndim == 5:
+        if is_tfcu:
+            # TFCU: pick center clip, center frame
+            n_idx = frames.shape[1] // 2
+            t_idx = frames.shape[2] // 2
+            image = frames[idx, n_idx, t_idx].permute(1, 2, 0).numpy()
+            if target.ndim == 6:
+                gt = target[idx, n_idx, t_idx, 0].numpy()
+            elif target.ndim == 5:
+                gt = target[idx, t_idx, 0].numpy() if target.shape[1] > 1 else target[idx, 0, 0].numpy()
+            else:
+                gt = target[idx, 0].numpy()
+            pd = pred[idx, n_idx, t_idx, 0].numpy() if pred.ndim == 6 else pred[idx, t_idx, 0].numpy()
+            prob = probs[idx, n_idx, t_idx, 0].numpy() if probs.ndim == 6 else probs[idx, t_idx, 0].numpy()
+        elif target.ndim == 5:
             frame_idx = target.shape[1] // 2
             image = frames[idx, frame_idx].permute(1, 2, 0).numpy()
             gt = target[idx, frame_idx, 0].numpy()
