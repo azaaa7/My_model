@@ -23,8 +23,8 @@ gt_ratio: 1
 # num_clips: clips per video sample (N dimension)
 # num_frames: frames per clip (T dimension)
 # In TFCU mode num_frames can be even (e.g. 4).
-num_clips: 3
-num_frames: 3
+num_clips: 2
+num_frames: 4
 clip_stride: 1
 
 # encoder_chunk: max frames to process at once through DINOv3 ViT-L.
@@ -38,7 +38,7 @@ batch_size: 1
 num_workers: 4
 grad_accum_steps: 8
 # augment_prob: data augmentation probability (0=off, 1=always).  Train mode only.
-augment_prob: 0
+augment_prob: 0.75
 
 # test_max_clips: max clips per sample in val/test mode.
 # Caps auto-expanded num_clips to avoid OOM (e.g. N=4 → 16 frames at T=4).
@@ -68,8 +68,8 @@ use_lora: true
 lora_rank: 32
 lora_alpha: 64
 lora_dropout: 0.1
-lora_targets: "attn.qkv"
-# lora_targets: "attn.qkv,attn.proj,mlp.fc1,mlp.fc2"
+# lora_targets: "attn.qkv"
+lora_targets: "attn.qkv,attn.proj,mlp.fc1,mlp.fc2"
 lora_layers: "all"
 
 # ── TFCU-Inpaint Adapter ──────────────────────────────────────────────────
@@ -124,10 +124,26 @@ gpu_id: 0
 # Multi-GPU: launch with torchrun; single-process training ignores these.
 dist_backend: nccl
 ddp_find_unused_parameters: false
+# Set false when resuming after changing GPUs/model trainable params.
+resume_optimizer: false
+strict_resume_optimizer: false
+# Launcher config. Set auto_torchrun=true to start DDP from this YAML via plain python.
+# Example below uses physical GPU 4 and 6. Inside the process they become cuda:0/cuda:1.
+auto_torchrun: true
+cuda_visible_devices: "2,3,4,5,6,7"
+nproc_per_node: 6
+torchrun_standalone: true
+nnodes: 1
+node_rank: 0
+master_addr: ""
+master_port: ""
+omp_num_threads: 1
+torchrun_log_dir: "runs/dinov3_vitl16_tfcu_inpaint_new_decoder_v1/torchrun_logs"
+torchrun_tee: "3"
 validate_every: 10
 threshold: 0.5
 eval_frame_chunk: 1
 
 # ── Output ────────────────────────────────────────────────────────────────
-save_dir: "runs/dinov3_vitl16_tfcu_inpaint_new_decoder"
-visualization_dir: "runs/dinov3_vitl16_tfcu_inpaint_new_decoder/vis"
+save_dir: "runs/dinov3_vitl16_tfcu_inpaint_new_decoder_v1"
+visualization_dir: "runs/dinov3_vitl16_tfcu_inpaint_new_decoder_v1/vis"

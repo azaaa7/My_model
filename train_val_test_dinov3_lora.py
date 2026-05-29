@@ -4,6 +4,8 @@ import argparse
 import builtins
 import json
 import os
+import subprocess
+import sys
 import warnings
 from contextlib import nullcontext
 from pathlib import Path
@@ -24,7 +26,15 @@ except ImportError:
         return fn
 
 from my_model import SegmentationLoss, VideoInpaintTFCU
-from my_model.dinov3_dpt_fpn import DPTReassembleNeck, FPNDecoder, ViTMultiLayerFusionPyramidNeck
+from my_model.dinov3_dpt_fpn import (
+    DPTReassembleNeck,
+    FPNDecoder,
+    LightASPP,
+    SemanticAnchorDecoder,
+    SemanticAnchorDetailStem,
+    SemanticAnchorMFCE,
+    ViTMultiLayerFusionPyramidNeck,
+)
 from my_model.metrics import AverageMeter, binary_metrics_from_logits, set_seed
 from train_val_test_convnext_lora import (
     count_parameters,
@@ -92,6 +102,85 @@ def init_distributed_mode(cfg: dict[str, Any]) -> tuple[bool, int, int, int]:
 def cleanup_distributed() -> None:
     if is_dist_avail_and_initialized():
         dist.destroy_process_group()
+
+
+def split_visible_devices(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple)):
+        return [str(item).strip() for item in value if str(item).strip()]
+    return [item.strip() for item in str(value).split(",") if item.strip()]
+
+
+def resolve_nproc_per_node(value: Any, visible_devices: Any = "") -> int:
+    if isinstance(value, str) and value.strip().lower() in {"auto", "all"}:
+        devices = split_visible_devices(visible_devices)
+        if devices:
+            return len(devices)
+        return torch.cuda.device_count() if torch.cuda.is_available() else 1
+    return int(value)
+
+
+def maybe_relaunch_with_torchrun(cfg: dict[str, Any]) -> None:
+    """Relaunch this script with torchrun when requested by config.
+
+    torchrun options such as nproc_per_node are launcher arguments, so they
+    cannot take effect inside an already-running single Python process.
+    """
+    if int(os.environ.get("WORLD_SIZE", "1")) > 1 or os.environ.get("LOCAL_RANK"):
+        return
+    if not bool(cfg.get("auto_torchrun", False)):
+        return
+
+    visible_devices = cfg.get("cuda_visible_devices", "")
+    nproc_per_node = resolve_nproc_per_node(cfg.get("nproc_per_node", 1), visible_devices)
+    if nproc_per_node <= 1:
+        return
+    if not torch.cuda.is_available():
+        raise RuntimeError("auto_torchrun requires CUDA, but torch.cuda.is_available() is false")
+
+    devices = split_visible_devices(visible_devices)
+    if devices and nproc_per_node > len(devices):
+        raise ValueError(
+            f"nproc_per_node={nproc_per_node} exceeds cuda_visible_devices count ({len(devices)}): "
+            f"{','.join(devices)}"
+        )
+
+    env = os.environ.copy()
+    if devices:
+        env["CUDA_VISIBLE_DEVICES"] = ",".join(devices)
+    env.setdefault("OMP_NUM_THREADS", str(cfg.get("omp_num_threads", 1)))
+
+    cmd = [sys.executable, "-m", "torch.distributed.run"]
+    if bool(cfg.get("torchrun_standalone", True)):
+        cmd.append("--standalone")
+    else:
+        cmd.extend(["--nnodes", str(cfg.get("nnodes", 1))])
+        cmd.extend(["--node_rank", str(cfg.get("node_rank", 0))])
+        if cfg.get("master_addr"):
+            cmd.extend(["--master_addr", str(cfg["master_addr"])])
+        if cfg.get("master_port"):
+            cmd.extend(["--master_port", str(cfg["master_port"])])
+    cmd.extend(["--nproc_per_node", str(nproc_per_node)])
+    log_dir = cfg.get("torchrun_log_dir", "")
+    if log_dir:
+        cmd.extend(["--log-dir", str(log_dir)])
+    tee = cfg.get("torchrun_tee", "")
+    if str(tee):
+        cmd.extend(["--tee", str(tee)])
+    cmd.append(str(Path(sys.argv[0]).resolve()))
+    cmd.extend(sys.argv[1:])
+
+    print(
+        "[torchrun] relaunching "
+        f"nproc_per_node={nproc_per_node} "
+        f"CUDA_VISIBLE_DEVICES={env.get('CUDA_VISIBLE_DEVICES', '<inherit>')}"
+    )
+    completed = subprocess.run(cmd, env=env)
+    print(f"[torchrun] exited with returncode={completed.returncode}")
+    if log_dir:
+        print(f"[torchrun] logs: {log_dir}")
+    raise SystemExit(completed.returncode)
 
 
 def split_path_list(value: Any) -> list[str]:
@@ -250,6 +339,14 @@ def parse_lora_layers(value: str) -> list[int] | None:
         if len(parts) == 2:
             return list(range(int(parts[0]), int(parts[1]) + 1))
     return [int(x.strip()) for x in value.split(",") if x.strip().isdigit()]
+
+
+def parse_int_tuple(value: Any, default: tuple[int, ...]) -> tuple[int, ...]:
+    if value is None or value == "":
+        return default
+    if isinstance(value, (list, tuple)):
+        return tuple(int(item) for item in value)
+    return tuple(int(item.strip()) for item in str(value).split(",") if item.strip())
 
 
 # ── DINOv3 Single-layer Patch Encoder ─────────────────────────────────────
@@ -454,6 +551,10 @@ class DINOv3ViTL16InpaintingDetector(nn.Module):
         neck_channels: int = 256,
         neck_variant: str = "fused32_pyramid",
         use_image_stem_skip: bool = False,
+        semantic_aspp_rates: tuple[int, ...] = (1, 2, 4, 8),
+        use_detail_stem: bool = False,
+        detail_stem_gated: bool = True,
+        detail_gate_init: float = -3.0,
         lora_block_indices: list[int] | None = None,
     ):
         super().__init__()
@@ -463,6 +564,8 @@ class DINOv3ViTL16InpaintingDetector(nn.Module):
         self.use_dpt_fpn = use_dpt_fpn
         self.neck_variant = str(neck_variant).strip().lower()
         self.use_image_stem_skip = bool(use_image_stem_skip)
+        self.use_detail_stem = bool(use_detail_stem)
+        self.last_aux: dict[str, torch.Tensor] = {}
 
         # LoRA injection (before freezing so LoRA params stay trainable)
         self.lora_layers = 0
@@ -492,10 +595,10 @@ class DINOv3ViTL16InpaintingDetector(nn.Module):
                         param.requires_grad = True
 
         if use_dpt_fpn:
-            if self.neck_variant not in {"dpt_reassemble", "fused32_pyramid"}:
+            if self.neck_variant not in {"dpt_reassemble", "fused32_pyramid", "semantic_anchor_mfce"}:
                 raise ValueError(
                     f"Unknown neck_variant '{neck_variant}'. "
-                    "Use 'dpt_reassemble' or 'fused32_pyramid'."
+                    "Use 'dpt_reassemble', 'fused32_pyramid', or 'semantic_anchor_mfce'."
                 )
 
             # Multi-layer encoder → DPT neck → FPN decoder
@@ -512,13 +615,37 @@ class DINOv3ViTL16InpaintingDetector(nn.Module):
                     layers=extract_layers,
                     use_image_stem_skip=self.use_image_stem_skip,
                 )
+                self.context = None
+                self.detail_stem = None
+                self.decoder = FPNDecoder(channels=neck_channels)
+            elif self.neck_variant == "semantic_anchor_mfce":
+                self.neck = SemanticAnchorMFCE(
+                    in_ch=DINOV3_FEATURE_DIM,
+                    out_ch=neck_channels,
+                    layers=extract_layers,
+                    return_projected=False,
+                )
+                self.context = LightASPP(channels=neck_channels, rates=semantic_aspp_rates)
+                self.detail_stem = (
+                    SemanticAnchorDetailStem(
+                        c1=64,
+                        c2=128,
+                        c3=neck_channels,
+                        gated=detail_stem_gated,
+                        gate_init=detail_gate_init,
+                    )
+                    if self.use_detail_stem else None
+                )
+                self.decoder = SemanticAnchorDecoder(c4=neck_channels, c3=neck_channels, c2=128, c1=64)
             else:
                 self.neck = DPTReassembleNeck(
                     in_ch=DINOV3_FEATURE_DIM,
                     out_ch=neck_channels,
                     layers=extract_layers,
                 )
-            self.decoder = FPNDecoder(channels=neck_channels)
+                self.context = None
+                self.detail_stem = None
+                self.decoder = FPNDecoder(channels=neck_channels)
             self.extract_layers = list(extract_layers)
         else:
             # Single-layer encoder → SimpleSegHead (DINOv3-IML style)
@@ -543,10 +670,14 @@ class DINOv3ViTL16InpaintingDetector(nn.Module):
         if self.use_dpt_fpn:
             # Flatten [B,T,3,H,W] → [B*T,3,H,W] before feature extraction
             frames = clip.reshape(batch_size * num_frames, channels, height, width)
-            features = self.extract_pyramid_features(frames, return_f32=False)
-            logits = self.decode_fpn(
-                features["p2"], features["p3"], features["p4"], features["p5"],
-            )
+            if self.neck_variant == "semantic_anchor_mfce":
+                features = self.extract_semantic_anchor_features(frames)
+                logits = self.decode_semantic_anchor(features["p4"], detail=features.get("detail"))
+            else:
+                features = self.extract_pyramid_features(frames, return_f32=False)
+                logits = self.decode_fpn(
+                    features["p2"], features["p3"], features["p4"], features["p5"],
+                )
             logits = logits.reshape(batch_size, num_frames, 1, height, width)
             return logits
         else:
@@ -565,6 +696,47 @@ class DINOv3ViTL16InpaintingDetector(nn.Module):
     # Public API for TFCU-Inpaint wrapper
     # ------------------------------------------------------------------
 
+    def _extract_flat_vit_features(self, frames: torch.Tensor) -> dict[int, torch.Tensor]:
+        feats = self.encoder(frames[:, None])  # {layer: [B, 1, 1024, H/16, W/16]}
+        return {k: v[:, 0] for k, v in feats.items()}
+
+    def extract_semantic_anchor_features(
+        self,
+        frames: torch.Tensor,
+    ) -> dict[str, torch.Tensor | dict[str, torch.Tensor]]:
+        """Extract Semantic-Anchor MFCE P4 and optional detail skips.
+
+        Returns no main P5 branch by design.
+        """
+        if not self.use_dpt_fpn:
+            raise RuntimeError("extract_semantic_anchor_features requires use_dpt_fpn=True")
+        if self.neck_variant != "semantic_anchor_mfce":
+            raise RuntimeError("extract_semantic_anchor_features requires neck_variant=semantic_anchor_mfce")
+
+        feats_flat = self._extract_flat_vit_features(frames)
+        p4_sem, aux = self.neck(feats_flat)
+        p4 = self.context(p4_sem)
+        detail = self.detail_stem(frames) if self.detail_stem is not None else None
+        self.last_aux = aux
+        out: dict[str, torch.Tensor | dict[str, torch.Tensor]] = {
+            "p4": p4,
+            "layer_attn": aux["layer_attn"],
+        }
+        if detail is not None:
+            out["detail"] = detail
+        return out
+
+    def decode_semantic_anchor(
+        self,
+        p4: torch.Tensor,
+        detail: dict[str, torch.Tensor] | None = None,
+    ) -> torch.Tensor:
+        if not self.use_dpt_fpn:
+            raise RuntimeError("decode_semantic_anchor requires use_dpt_fpn=True")
+        if self.neck_variant != "semantic_anchor_mfce":
+            raise RuntimeError("decode_semantic_anchor requires neck_variant=semantic_anchor_mfce")
+        return self.decoder(p4, detail=detail)
+
     def extract_pyramid_features(
         self,
         frames: torch.Tensor,
@@ -579,9 +751,13 @@ class DINOv3ViTL16InpaintingDetector(nn.Module):
         """
         if not self.use_dpt_fpn:
             raise RuntimeError("extract_pyramid_features requires use_dpt_fpn=True")
+        if self.neck_variant == "semantic_anchor_mfce":
+            raise RuntimeError(
+                "semantic_anchor_mfce does not build a p2/p3/p4/p5 pyramid; "
+                "use extract_semantic_anchor_features instead"
+            )
 
-        feats = self.encoder(frames[:, None])  # {layer: [B, 1, 1024, 32, 32]}
-        feats_flat = {k: v[:, 0] for k, v in feats.items()}
+        feats_flat = self._extract_flat_vit_features(frames)
 
         if self.neck_variant == "fused32_pyramid":
             pyramid = self.neck(feats_flat, frames=frames)
@@ -660,9 +836,8 @@ def validate_config(cfg: dict[str, Any], mode: str) -> None:
     num_frames = int(cfg.get("num_frames", 0))
     num_clips = int(cfg.get("num_clips", 1))
     neck_variant = str(cfg.get("neck_variant", "fused32_pyramid")).strip().lower()
-    temporal_insert_level = str(
-        cfg.get("temporal_insert_level", "F32" if neck_variant == "fused32_pyramid" else "P4")
-    ).strip().upper()
+    default_temporal_level = "F32" if neck_variant == "fused32_pyramid" else "P4"
+    temporal_insert_level = str(cfg.get("temporal_insert_level", default_temporal_level)).strip().upper()
 
     if mode not in {"train", "val", "test"}:
         errors.append(f"type must be train/val/test, got {mode}")
@@ -674,12 +849,14 @@ def validate_config(cfg: dict[str, Any], mode: str) -> None:
         errors.append("batch_size must be > 0")
     if int(cfg.get("grad_accum_steps", 1)) <= 0:
         errors.append("grad_accum_steps must be > 0")
-    if neck_variant not in {"dpt_reassemble", "fused32_pyramid"}:
-        errors.append("neck_variant must be dpt_reassemble or fused32_pyramid")
+    if neck_variant not in {"dpt_reassemble", "fused32_pyramid", "semantic_anchor_mfce"}:
+        errors.append("neck_variant must be dpt_reassemble, fused32_pyramid, or semantic_anchor_mfce")
     if neck_variant == "fused32_pyramid" and temporal_insert_level != "F32":
         errors.append("neck_variant=fused32_pyramid requires temporal_insert_level=F32")
     if neck_variant == "dpt_reassemble" and temporal_insert_level != "P4":
         errors.append("neck_variant=dpt_reassemble requires temporal_insert_level=P4")
+    if neck_variant == "semantic_anchor_mfce" and temporal_insert_level not in {"P4", "NONE"}:
+        errors.append("neck_variant=semantic_anchor_mfce requires temporal_insert_level=P4 or NONE")
 
     if use_tfcu:
         if num_frames <= 0:
@@ -731,6 +908,7 @@ def build_model(cfg: dict[str, Any], device: torch.device, base_dir: Path) -> nn
         extract_layers = tuple(int(x.strip()) for x in str(extract_layers_str).split(",") if x.strip())
     neck_channels = int(cfg.get("neck_channels", 256))
     neck_variant = str(cfg.get("neck_variant", "fused32_pyramid")).strip().lower()
+    semantic_aspp_rates = parse_int_tuple(cfg.get("semantic_aspp_rates", "1,2,4,8"), (1, 2, 4, 8))
     lora_block_indices = parse_lora_layers(cfg.get("lora_layers", "all"))
     use_tfcu_adapter = bool(cfg.get("use_tfcu_adapter", False))
 
@@ -750,6 +928,10 @@ def build_model(cfg: dict[str, Any], device: torch.device, base_dir: Path) -> nn
         neck_channels=neck_channels,
         neck_variant=neck_variant,
         use_image_stem_skip=bool(cfg.get("use_image_stem_skip", False)),
+        semantic_aspp_rates=semantic_aspp_rates,
+        use_detail_stem=bool(cfg.get("use_detail_stem", False)),
+        detail_stem_gated=bool(cfg.get("detail_stem_gated", True)),
+        detail_gate_init=float(cfg.get("detail_gate_init", -3.0)),
         lora_block_indices=lora_block_indices,
     )
 
@@ -1173,6 +1355,10 @@ def train(
             decoder_params.extend(p for p in model_without_ddp.base.decoder.parameters() if p.requires_grad)
         if hasattr(model_without_ddp.base, "neck") and model_without_ddp.base.neck is not None:
             decoder_params.extend(p for p in model_without_ddp.base.neck.parameters() if p.requires_grad)
+        if hasattr(model_without_ddp.base, "context") and model_without_ddp.base.context is not None:
+            decoder_params.extend(p for p in model_without_ddp.base.context.parameters() if p.requires_grad)
+        if hasattr(model_without_ddp.base, "detail_stem") and model_without_ddp.base.detail_stem is not None:
+            decoder_params.extend(p for p in model_without_ddp.base.detail_stem.parameters() if p.requires_grad)
         if decoder_params:
             param_groups.append({
                 "params": decoder_params,
@@ -1250,12 +1436,36 @@ def train(
     # ── restore optimizer & scheduler state from checkpoint ──────────────
     if checkpoint_path and Path(checkpoint_path).exists() and resume_epoch > 0:
         state = torch.load(checkpoint_path, map_location=device)
-        if isinstance(state, dict) and "optimizer" in state:
-            optimizer.load_state_dict(state["optimizer"])
-            print(f"[resume] optimizer state restored (epoch {resume_epoch})")
-        if isinstance(state, dict) and "scheduler" in state:
-            scheduler.load_state_dict(state["scheduler"])
-            print(f"[resume] scheduler state restored")
+        optimizer_restored = False
+        if isinstance(state, dict) and "optimizer" in state and bool(cfg.get("resume_optimizer", True)):
+            try:
+                optimizer.load_state_dict(state["optimizer"])
+                optimizer_restored = True
+                print(f"[resume] optimizer state restored (epoch {resume_epoch})")
+            except (ValueError, RuntimeError) as exc:
+                if bool(cfg.get("strict_resume_optimizer", False)):
+                    raise
+                print(
+                    "[resume] optimizer state skipped because parameter groups do not match. "
+                    "Continuing with fresh optimizer state. "
+                    f"Reason: {exc}"
+                )
+        elif isinstance(state, dict) and "optimizer" in state:
+            print("[resume] optimizer state skipped by resume_optimizer=false")
+
+        if isinstance(state, dict) and "scheduler" in state and optimizer_restored:
+            try:
+                scheduler.load_state_dict(state["scheduler"])
+                print(f"[resume] scheduler state restored")
+            except (ValueError, RuntimeError) as exc:
+                if bool(cfg.get("strict_resume_optimizer", False)):
+                    raise
+                print(
+                    "[resume] scheduler state skipped because it does not match the current optimizer. "
+                    f"Reason: {exc}"
+                )
+        elif isinstance(state, dict) and "scheduler" in state:
+            print("[resume] scheduler state skipped because optimizer state was not restored")
 
     if distributed:
         if device.type != "cuda":
@@ -1279,7 +1489,29 @@ def train(
     val_loader = make_loader(cfg, "val", distributed=distributed, rank=rank, world_size=world_size)
 
     start_epoch = resume_epoch + 1
-    for epoch in range(start_epoch, int(cfg["n_epochs"]) + 1):
+    max_epoch = int(cfg["n_epochs"])
+    if rank == 0:
+        print(
+            f"[resume] checkpoint_epoch={resume_epoch} start_epoch={start_epoch} "
+            f"max_epoch={max_epoch} best_iou={best_iou:.4f}"
+        )
+        print(
+            f"[loader] train_batches_per_rank={len(train_loader)} "
+            f"val_batches_per_rank={len(val_loader)} world_size={world_size}"
+        )
+    if len(train_loader) == 0:
+        raise RuntimeError(
+            "train_loader has 0 batches on this rank. "
+            "Reduce world_size/batch_size or disable train drop_last."
+        )
+    if start_epoch > max_epoch:
+        if rank == 0:
+            print(
+                "[resume] checkpoint epoch is already >= n_epochs; nothing to train. "
+                "Increase n_epochs or resume from an earlier checkpoint."
+            )
+        return
+    for epoch in range(start_epoch, max_epoch + 1):
         if distributed and hasattr(train_loader.sampler, "set_epoch"):
             train_loader.sampler.set_epoch(epoch)
 
@@ -1492,9 +1724,14 @@ def main() -> None:
     parser.add_argument("--lora_dropout", type=float, default=None)
     parser.add_argument("--lora_targets", type=str, default=None)
     parser.add_argument("--lora_layers", type=str, default=None)
-    parser.add_argument("--neck_variant", type=str, default=None, choices=["dpt_reassemble", "fused32_pyramid"])
+    parser.add_argument("--neck_variant", type=str, default=None, choices=["dpt_reassemble", "fused32_pyramid", "semantic_anchor_mfce"])
     parser.add_argument("--temporal_insert_level", type=str, default=None)
     parser.add_argument("--use_image_stem_skip", type=str2bool, default=None)
+    parser.add_argument("--semantic_aspp_rates", type=str, default=None)
+    parser.add_argument("--use_detail_stem", type=str2bool, default=None)
+    parser.add_argument("--detail_stem_gated", type=str2bool, default=None)
+    parser.add_argument("--detail_gate_init", type=float, default=None)
+    parser.add_argument("--p4_gate_init", type=float, default=None)
     parser.add_argument("--save_dir", type=str, default=None)
     parser.add_argument("--visualization_dir", type=str, default=None)
     parser.add_argument("--augment_prob", type=float, default=None)
@@ -1502,6 +1739,19 @@ def main() -> None:
     parser.add_argument("--gpu_id", type=int, default=None)
     parser.add_argument("--dist_backend", type=str, default=None)
     parser.add_argument("--ddp_find_unused_parameters", type=str2bool, default=None)
+    parser.add_argument("--resume_optimizer", type=str2bool, default=None)
+    parser.add_argument("--strict_resume_optimizer", type=str2bool, default=None)
+    parser.add_argument("--auto_torchrun", type=str2bool, default=None)
+    parser.add_argument("--nproc_per_node", type=str, default=None)
+    parser.add_argument("--cuda_visible_devices", type=str, default=None)
+    parser.add_argument("--torchrun_standalone", type=str2bool, default=None)
+    parser.add_argument("--nnodes", type=int, default=None)
+    parser.add_argument("--node_rank", type=int, default=None)
+    parser.add_argument("--master_addr", type=str, default=None)
+    parser.add_argument("--master_port", type=str, default=None)
+    parser.add_argument("--omp_num_threads", type=int, default=None)
+    parser.add_argument("--torchrun_log_dir", type=str, default=None)
+    parser.add_argument("--torchrun_tee", type=str, default=None)
     # TFCU adapter options
     parser.add_argument("--use_tfcu_adapter", type=str2bool, default=None)
     parser.add_argument("--num_clips", type=int, default=None)
@@ -1522,6 +1772,7 @@ def main() -> None:
     cfg_path = resolve_config_path(args.config)
     cfg = merge_cli_config(load_config(str(cfg_path)), args)
     base_dir = cfg_path.parent.parent
+    has_explicit_temporal_insert_level = "temporal_insert_level" in cfg
 
     defaults = {
         "dinov3_weights": DINOV3_WEIGHT_NAME,
@@ -1537,6 +1788,11 @@ def main() -> None:
         "neck_variant": "fused32_pyramid",
         "temporal_insert_level": "F32",
         "use_image_stem_skip": False,
+        "semantic_aspp_rates": "1,2,4,8",
+        "use_detail_stem": False,
+        "detail_stem_gated": True,
+        "detail_gate_init": -3.0,
+        "p4_gate_init": -3.0,
         "save_dir": "runs/dinov3_vitl16",
         "visualization_dir": "runs/dinov3_vitl16/vis",
         "checkpoint": "",
@@ -1546,6 +1802,19 @@ def main() -> None:
         "augment_prob": 0.75,
         "dist_backend": "nccl",
         "ddp_find_unused_parameters": False,
+        "resume_optimizer": True,
+        "strict_resume_optimizer": False,
+        "auto_torchrun": False,
+        "nproc_per_node": 1,
+        "cuda_visible_devices": "",
+        "torchrun_standalone": True,
+        "nnodes": 1,
+        "node_rank": 0,
+        "master_addr": "",
+        "master_port": "",
+        "omp_num_threads": 1,
+        "torchrun_log_dir": "",
+        "torchrun_tee": "",
         # TFCU defaults
         "use_tfcu_adapter": False,
         "num_clips": 1,
@@ -1564,6 +1833,9 @@ def main() -> None:
     }
     for key, value in defaults.items():
         cfg.setdefault(key, value)
+    if not has_explicit_temporal_insert_level:
+        neck_variant = str(cfg.get("neck_variant", "fused32_pyramid")).strip().lower()
+        cfg["temporal_insert_level"] = "F32" if neck_variant == "fused32_pyramid" else "P4"
 
     for key in [
         "train_samples",
@@ -1580,6 +1852,7 @@ def main() -> None:
 
     mode = cfg.get("type", "train")
     validate_config(cfg, mode)
+    maybe_relaunch_with_torchrun(cfg)
 
     distributed = False
     rank = 0

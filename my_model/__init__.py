@@ -3,7 +3,11 @@ from .dinov3_dpt_fpn import (
     DPTReassembleNeck,
     FPNDecoder,
     HighResolutionImageStem,
+    LightASPP,
     ReassembleBlock,
+    SemanticAnchorDecoder,
+    SemanticAnchorDetailStem,
+    SemanticAnchorMFCE,
     ViTMultiLayerFusionPyramidNeck,
 )
 from .losses import (
@@ -23,7 +27,7 @@ from .temporal import (
     MaskPromptEncoder,
     TFCUInpaintAdapter,
 )
-from .video_inpaint_tfcu import VideoInpaintTFCU
+from .video_inpaint_tfcu import GatedTemporalInjector, VideoInpaintTFCU
 
 __all__ = [
     "BoundaryLoss",
@@ -33,12 +37,17 @@ __all__ = [
     "EdgeLoss",
     "FocalLoss",
     "FPNDecoder",
+    "GatedTemporalInjector",
     "HighResolutionImageStem",
     "InpaintMemoryAttention",
     "IoULoss",
+    "LightASPP",
     "LocalTemporalDifferenceModule",
     "MaskPromptEncoder",
     "ReassembleBlock",
+    "SemanticAnchorDecoder",
+    "SemanticAnchorDetailStem",
+    "SemanticAnchorMFCE",
     "SegmentationLoss",
     "TemporalDeltaLoss",
     "TFCUInpaintAdapter",

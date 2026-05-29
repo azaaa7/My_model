@@ -16,14 +16,20 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import torch
 import torch.nn as nn
 
-from my_model.dinov3_dpt_fpn import ViTMultiLayerFusionPyramidNeck
+from my_model.dinov3_dpt_fpn import (
+    LightASPP,
+    SemanticAnchorDecoder,
+    SemanticAnchorDetailStem,
+    SemanticAnchorMFCE,
+    ViTMultiLayerFusionPyramidNeck,
+)
 from my_model.temporal import (
     InpaintMemoryAttention,
     LocalTemporalDifferenceModule,
     MaskPromptEncoder,
     TFCUInpaintAdapter,
 )
-from my_model.video_inpaint_tfcu import VideoInpaintTFCU
+from my_model.video_inpaint_tfcu import GatedTemporalInjector, VideoInpaintTFCU
 
 
 def test_local_temporal_difference() -> None:
@@ -40,7 +46,7 @@ def test_local_temporal_difference() -> None:
 def test_memory_attention() -> None:
     """Verify InpaintMemoryAttention output shape."""
     print("[test] InpaintMemoryAttention ...", end=" ")
-    B, K, T, C, H, W = 1, 4, 4, 256, 32, 32
+    B, K, T, C, H, W = 1, 2, 2, 64, 8, 8
     cur = torch.randn(B, T, C, H, W)
     mem = torch.randn(B, K, T, C, H, W)
     m = InpaintMemoryAttention(channels=C, num_heads=8)
@@ -52,7 +58,7 @@ def test_memory_attention() -> None:
 def test_memory_attention_spatial_pool() -> None:
     """Verify spatial-pooled memory attention."""
     print("[test] InpaintMemoryAttention (spatial pool) ...", end=" ")
-    B, K, T, C, H, W = 1, 4, 4, 256, 32, 32
+    B, K, T, C, H, W = 1, 2, 2, 64, 32, 32
     cur = torch.randn(B, T, C, H, W)
     mem = torch.randn(B, K, T, C, H, W)
     m = InpaintMemoryAttention(channels=C, num_heads=8, use_spatial_pool=True, pool_size=16)
@@ -64,7 +70,7 @@ def test_memory_attention_spatial_pool() -> None:
 def test_tfcu_adapter() -> None:
     """Verify TFCUInpaintAdapter output shape."""
     print("[test] TFCUInpaintAdapter ...", end=" ")
-    B, N, T, C, H, W = 1, 4, 4, 256, 32, 32
+    B, N, T, C, H, W = 1, 3, 2, 64, 8, 8
     P4 = torch.randn(B * N * T, C, H, W)
     m = TFCUInpaintAdapter(channels=C, memory_len=4)
     y = m(P4, B=B, N=N, T=T)
@@ -165,6 +171,49 @@ def test_fused32_pyramid_shape() -> None:
     print("OK")
 
 
+def test_semantic_anchor_mfce_shape_and_attention() -> None:
+    """Verify semantic-anchor MFCE fuses same-resolution ViT layers."""
+    print("[test] SemanticAnchorMFCE shape + attention ...", end=" ")
+    feats = {
+        5: torch.randn(2, 1024, 32, 32),
+        11: torch.randn(2, 1024, 32, 32),
+        17: torch.randn(2, 1024, 32, 32),
+        23: torch.randn(2, 1024, 32, 32),
+    }
+    mfce = SemanticAnchorMFCE(
+        in_ch=1024,
+        out_ch=256,
+        layers=(5, 11, 17, 23),
+    )
+    p4, aux = mfce(feats)
+    layer_attn = aux["layer_attn"]
+    assert p4.shape == (2, 256, 32, 32), p4.shape
+    assert layer_attn.shape == (2, 4, 1, 32, 32), layer_attn.shape
+    assert torch.allclose(
+        layer_attn.sum(dim=1),
+        torch.ones(2, 1, 32, 32),
+        atol=1e-6,
+    )
+    print("OK")
+
+
+def test_semantic_anchor_aspp_decoder_shape() -> None:
+    """Verify P4 context and P4->P3->P2->P1 decoder shapes."""
+    print("[test] SemanticAnchor ASPP + decoder shape ...", end=" ")
+    p4 = torch.randn(2, 256, 32, 32)
+    aspp = LightASPP(channels=256, rates=(1, 2, 4, 8))
+    decoder = SemanticAnchorDecoder(c4=256, c3=256, c2=128, c1=64)
+    p4_ctx = aspp(p4)
+    assert p4_ctx.shape == (2, 256, 32, 32), p4_ctx.shape
+    logits = decoder(p4_ctx)
+    assert logits.shape == (2, 1, 512, 512), logits.shape
+    detail_stem = SemanticAnchorDetailStem(c1=64, c2=128, c3=256)
+    detail = detail_stem(torch.randn(2, 3, 512, 512))
+    logits_detail = decoder(p4_ctx, detail=detail)
+    assert logits_detail.shape == (2, 1, 512, 512), logits_detail.shape
+    print("OK")
+
+
 class CaptureAdapter(nn.Module):
     def __init__(self):
         super().__init__()
@@ -218,6 +267,40 @@ class FakeDPTBase(FakeFused32Base):
         )
 
 
+class FakeSemanticAnchorBase(nn.Module):
+    use_dpt_fpn = True
+    neck_variant = "semantic_anchor_mfce"
+
+    def __init__(self, channels: int = 32, use_detail: bool = False):
+        super().__init__()
+        self.channels = channels
+        self.use_detail = use_detail
+        self.last_aux = {}
+
+    def extract_semantic_anchor_features(self, frames):
+        batch = frames.shape[0]
+        p4 = torch.randn(batch, self.channels, 32, 32, device=frames.device)
+        features = {
+            "p4": p4,
+            "layer_attn": torch.full(
+                (batch, 4, 1, 32, 32),
+                0.25,
+                device=frames.device,
+            ),
+        }
+        if self.use_detail:
+            features["detail"] = {
+                "p1": torch.randn(batch, 64, 256, 256, device=frames.device),
+                "p2": torch.randn(batch, 128, 128, 128, device=frames.device),
+                "p3": torch.randn(batch, self.channels, 64, 64, device=frames.device),
+            }
+        self.last_aux = {"layer_attn": features["layer_attn"]}
+        return features
+
+    def decode_semantic_anchor(self, p4, detail=None):
+        return torch.zeros(p4.shape[0], 1, 512, 512, device=p4.device)
+
+
 def test_video_inpaint_tfcu_forward_fused32_shape() -> None:
     """Verify VideoInpaintTFCU keeps output shape on fused32 path."""
     print("[test] VideoInpaintTFCU fused32 forward shape ...", end=" ")
@@ -229,6 +312,25 @@ def test_video_inpaint_tfcu_forward_fused32_shape() -> None:
         "use_memory": False,
     }
     model = VideoInpaintTFCU(FakeFused32Base(channels=32), cfg)
+    video = torch.randn(1, 2, 4, 3, 512, 512)
+    with torch.no_grad():
+        logits = model(video)
+    assert logits.shape == (1, 2, 4, 1, 512, 512), logits.shape
+    print("OK")
+
+
+def test_video_inpaint_tfcu_forward_semantic_anchor_shape() -> None:
+    """Verify VideoInpaintTFCU keeps output shape on semantic-anchor path."""
+    print("[test] VideoInpaintTFCU semantic-anchor forward shape ...", end=" ")
+    cfg = {
+        "neck_channels": 32,
+        "neck_variant": "semantic_anchor_mfce",
+        "temporal_insert_level": "P4",
+        "p4_gate_init": -3.0,
+        "memory_len": 2,
+        "use_memory": False,
+    }
+    model = VideoInpaintTFCU(FakeSemanticAnchorBase(channels=32, use_detail=True), cfg)
     video = torch.randn(1, 2, 4, 3, 512, 512)
     with torch.no_grad():
         logits = model(video)
@@ -253,6 +355,42 @@ def test_tfcu_insert_receives_f32() -> None:
     with torch.no_grad():
         _ = model(video)
     assert capture.seen_shape == (8, 32, 32, 32), capture.seen_shape
+    print("OK")
+
+
+def test_semantic_anchor_tfcu_insert_receives_p4_and_gate_init() -> None:
+    """Verify semantic-anchor path sends P4 to a gated TFCU branch."""
+    print("[test] semantic-anchor P4 gated TFCU ...", end=" ")
+    cfg = {
+        "neck_channels": 32,
+        "neck_variant": "semantic_anchor_mfce",
+        "temporal_insert_level": "P4",
+        "p4_gate_init": -3.0,
+        "memory_len": 2,
+        "use_memory": False,
+    }
+    model = VideoInpaintTFCU(FakeSemanticAnchorBase(channels=32), cfg)
+    assert isinstance(model.temporal_adapter, GatedTemporalInjector)
+    assert torch.allclose(model.temporal_adapter.logit_gate, torch.tensor(-3.0))
+    assert 0.04 < model.temporal_adapter.gate.item() < 0.06
+
+    capture = CaptureAdapter()
+    model.temporal_adapter = capture
+    video = torch.randn(1, 2, 4, 3, 512, 512)
+    with torch.no_grad():
+        _ = model(video)
+    assert capture.seen_shape == (8, 32, 32, 32), capture.seen_shape
+    print("OK")
+
+
+def test_semantic_anchor_no_main_p5() -> None:
+    """Verify semantic-anchor extraction exposes P4, not a main P5 branch."""
+    print("[test] semantic-anchor has no main P5 ...", end=" ")
+    base = FakeSemanticAnchorBase(channels=32)
+    features = base.extract_semantic_anchor_features(torch.randn(2, 3, 512, 512))
+    assert "p4" in features
+    assert "p5" not in features
+    assert "p2" not in features and "p3" not in features
     print("OK")
 
 
@@ -320,6 +458,32 @@ def test_legacy_dpt_reassemble_p4_fallback() -> None:
     print("OK")
 
 
+def test_semantic_anchor_backward_gradients() -> None:
+    """Verify small semantic-anchor modules have a valid backward path."""
+    print("[test] SemanticAnchor backward gradients ...", end=" ")
+    mfce = SemanticAnchorMFCE(in_ch=16, out_ch=32, layers=(5, 11))
+    aspp = LightASPP(channels=32, rates=(1, 2))
+    detail_stem = SemanticAnchorDetailStem(c1=8, c2=16, c3=32)
+    decoder = SemanticAnchorDecoder(c4=32, c3=32, c2=16, c1=8)
+    feats = {
+        5: torch.randn(1, 16, 32, 32, requires_grad=True),
+        11: torch.randn(1, 16, 32, 32, requires_grad=True),
+    }
+    frames = torch.randn(1, 3, 512, 512, requires_grad=True)
+    p4, aux = mfce(feats)
+    p4 = aspp(p4)
+    detail = detail_stem(frames)
+    logits = decoder(p4, detail=detail)
+    loss = logits.mean() + aux["layer_attn"].mean()
+    loss.backward()
+
+    assert mfce.projections["5"][0].weight.grad is not None
+    assert aspp.project[0].weight.grad is not None
+    assert decoder.head[-1].weight.grad is not None
+    assert detail_stem.stem1.block[0].weight.grad is not None
+    print("OK")
+
+
 def main() -> None:
     tests = [
         test_local_temporal_difference,
@@ -332,11 +496,17 @@ def main() -> None:
         test_memory_causal,
         test_deterministic_without_memory,
         test_fused32_pyramid_shape,
+        test_semantic_anchor_mfce_shape_and_attention,
+        test_semantic_anchor_aspp_decoder_shape,
         test_video_inpaint_tfcu_forward_fused32_shape,
+        test_video_inpaint_tfcu_forward_semantic_anchor_shape,
         test_tfcu_insert_receives_f32,
+        test_semantic_anchor_tfcu_insert_receives_p4_and_gate_init,
+        test_semantic_anchor_no_main_p5,
         test_image_stem_skip_zero_init,
         test_image_stem_skip_disabled_has_no_trainable_unused_scales,
         test_legacy_dpt_reassemble_p4_fallback,
+        test_semantic_anchor_backward_gradients,
     ]
     passed = 0
     for test_fn in tests:

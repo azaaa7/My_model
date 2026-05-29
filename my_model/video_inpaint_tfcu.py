@@ -26,6 +26,30 @@ import torch.nn as nn
 from .temporal import TFCUInpaintAdapter
 
 
+class GatedTemporalInjector(nn.Module):
+    """Apply a TFCU adapter as a gated residual branch."""
+
+    def __init__(self, tfcu_module: nn.Module, init: float = -3.0):
+        super().__init__()
+        self.tfcu = tfcu_module
+        self.logit_gate = nn.Parameter(torch.tensor(float(init)))
+
+    @property
+    def gate(self) -> torch.Tensor:
+        return torch.sigmoid(self.logit_gate)
+
+    def forward(self, x: torch.Tensor, B: int, N: int, T: int) -> torch.Tensor:
+        enhanced = self.tfcu(x, B=B, N=N, T=T)
+        return x + self.gate * (enhanced - x)
+
+
+class NoOpTemporalInjector(nn.Module):
+    """No-parameter temporal adapter used for semantic-anchor no-temporal ablations."""
+
+    def forward(self, x: torch.Tensor, B: int, N: int, T: int) -> torch.Tensor:
+        return x
+
+
 class VideoInpaintTFCU(nn.Module):
     """DINOv3 + LoRA + DPT-FPN + TFCU-Inpaint temporal adapter.
 
@@ -59,17 +83,26 @@ class VideoInpaintTFCU(nn.Module):
             raise ValueError("neck_variant=fused32_pyramid requires temporal_insert_level=F32")
         if self.neck_variant == "dpt_reassemble" and self.temporal_insert_level != "P4":
             raise ValueError("neck_variant=dpt_reassemble requires temporal_insert_level=P4")
-        if self.neck_variant not in {"fused32_pyramid", "dpt_reassemble"}:
+        if self.neck_variant == "semantic_anchor_mfce" and self.temporal_insert_level not in {"P4", "NONE"}:
+            raise ValueError("neck_variant=semantic_anchor_mfce requires temporal_insert_level=P4 or NONE")
+        if self.neck_variant not in {"fused32_pyramid", "dpt_reassemble", "semantic_anchor_mfce"}:
             raise ValueError(f"Unknown neck_variant: {self.neck_variant}")
 
-        use_memory = bool(cfg.get("use_memory", True)) and self.num_clips > 1
-        self.temporal_adapter = TFCUInpaintAdapter(
-            channels=channels,
-            memory_len=int(cfg.get("memory_len", 4)),
-            use_memory=use_memory,
-            use_spatial_pool=bool(cfg.get("use_spatial_pool", False)),
-            detach_memory=bool(cfg.get("detach_memory", True)),
-        )
+        if self.neck_variant == "semantic_anchor_mfce" and self.temporal_insert_level == "NONE":
+            self.temporal_adapter = NoOpTemporalInjector()
+        else:
+            use_memory = bool(cfg.get("use_memory", True)) and self.num_clips > 1
+            tfcu = TFCUInpaintAdapter(
+                channels=channels,
+                memory_len=int(cfg.get("memory_len", 4)),
+                use_memory=use_memory,
+                use_spatial_pool=bool(cfg.get("use_spatial_pool", False)),
+                detach_memory=bool(cfg.get("detach_memory", True)),
+            )
+            if self.neck_variant == "semantic_anchor_mfce" and self.temporal_insert_level == "P4":
+                self.temporal_adapter = GatedTemporalInjector(tfcu, init=float(cfg.get("p4_gate_init", -3.0)))
+            else:
+                self.temporal_adapter = tfcu
 
         self._input_size = int(cfg.get("input_size", 512))
         # Encoder chunk size — process at most this many frames at once
@@ -130,6 +163,38 @@ class VideoInpaintTFCU(nn.Module):
         frames = video.reshape(B * N * T, C, H, W)       # [BNT, 3, H, W]
         total_frames = frames.shape[0]
         chunk = self._encoder_chunk if self._encoder_chunk > 0 else total_frames
+
+        if self.neck_variant == "semantic_anchor_mfce":
+            p4_parts = []
+            detail_parts: dict[str, list[torch.Tensor]] = {}
+            layer_attn_parts = []
+            for start in range(0, total_frames, chunk):
+                end = min(start + chunk, total_frames)
+                features = self.base.extract_semantic_anchor_features(frames[start:end])
+                p4_parts.append(features["p4"])
+                if "layer_attn" in features:
+                    layer_attn_parts.append(features["layer_attn"])
+                detail = features.get("detail")
+                if isinstance(detail, dict):
+                    for key in ("p1", "p2", "p3"):
+                        if key in detail:
+                            detail_parts.setdefault(key, []).append(detail[key])
+
+            P4 = torch.cat(p4_parts, dim=0)             # [BNT, C, 32, 32]
+            if self.temporal_insert_level == "P4":
+                P4 = self.temporal_adapter(P4, B=B, N=N, T=T)
+
+            detail_cat = {
+                key: torch.cat(parts, dim=0)
+                for key, parts in detail_parts.items()
+            } or None
+            if layer_attn_parts:
+                self.base.last_aux = {"layer_attn": torch.cat(layer_attn_parts, dim=0)}
+            logits = self.base.decode_semantic_anchor(P4, detail=detail_cat)
+            logits = logits.reshape(B, N, T, 1, H, W)
+            if squeeze_n:
+                logits = logits[:, 0]
+            return logits
 
         if self.temporal_insert_level == "F32":
             f32_parts = []

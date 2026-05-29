@@ -102,12 +102,37 @@ F2 (128×128) → upsample → Conv(256→128) @ 256×256
 旧结构仍可通过 `neck_variant: dpt_reassemble` 回退。旧结构里 `DPTReassembleNeck` 会把不同 block 直接重组为 P2/P3/P4/P5，但这不再是推荐默认。
 每个 FPN ConvBlock = `Conv3×3 → GroupNorm → GELU`。
 
+### 变体 D：Semantic-Anchor MFCE + P4 Gated TFCU
+
+新增结构使用 `neck_variant: semantic_anchor_mfce`。它同样承认 DINOv3 ViT 多个 block 都是 32×32 token map，但不再先 concat 成 F32 pyramid，而是用 MFCE-style spatial layer attention 在 1/16 分辨率自适应融合出 P4 semantic anchor：
+
+```text
+DINO block 5   → [*,1024,32,32]
+DINO block 11  → [*,1024,32,32]
+DINO block 17  → [*,1024,32,32]
+DINO block 23  → [*,1024,32,32]
+        ↓ per-layer 1×1 projection 到 neck_channels
+        ↓ per-layer spatial score
+        ↓ softmax over layer dimension
+P4_sem [*,256,32,32]
+        ↓ LightASPP context
+P4 [*,256,32,32]
+        ↓ gated TFCU residual, gate init = -3.0
+enhanced P4
+        ↓ top-down decoder
+P3 [*,256,64,64] → P2 [*,128,128,128] → P1 [*,64,256,256]
+        ↓ upsample
+logits [*,1,512,512]
+```
+
+这个变体没有主 P5 分支；P5 不再作为 temporal/prompt 主输入。可选 `use_detail_stem=true` 时，RGB detail stem 只注入 P3/P2/P1，用来补充局部边界纹理，默认关闭方便先做结构消融。
+
 ### 输出
 
 | 变体 | 输出形状 |
 |------|---------|
 | A / B | `[B, T, 1, 512, 512]` logits（未经 sigmoid） |
-| C | `[B, N, T, 1, 512, 512]` logits（未经 sigmoid） |
+| C / D | `[B, N, T, 1, 512, 512]` logits（未经 sigmoid） |
 
 ---
 
@@ -479,6 +504,17 @@ use_tfcu_adapter: true
 neck_variant: fused32_pyramid
 temporal_insert_level: F32
 num_clips: 4
+num_frames: 4
+
+# 变体 D — Semantic-Anchor MFCE + P4 Gated TFCU
+use_dpt_fpn: true
+use_tfcu_adapter: true
+neck_variant: semantic_anchor_mfce
+temporal_insert_level: P4
+semantic_aspp_rates: "1,2,4,8"
+use_detail_stem: false
+p4_gate_init: -3.0
+num_clips: 2
 num_frames: 4
 ```
 

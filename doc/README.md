@@ -2,6 +2,12 @@
 
 这个项目包含一个相对简单的视频 inpainting 检测模型，并保留 `zzz_dataset_toolkit` 作为数据读取工具。
 
+## DINOv3 / TFCU 文档入口
+
+- `DINOv3_ViTL16_LoRA.md`: DINOv3 ViT-L/16、LoRA、FPN/TFCU 的完整说明。
+- `Semantic_Anchor_MFCE_agent_implementation_guide.md`: Semantic-Anchor MFCE 的实现约束和验收标准。
+- `Semantic_Anchor_MFCE_P4_TFCU_Tutorial.md`: 新结构的使用教程、配置注释说明、训练/验证/测试命令。
+
 ## 1. 模型结构
 
 模型使用 `ZZZ_model` 中的 `HRNet` 作为逐帧 backbone，再接一个轻量 decoder 输出 mask logits。

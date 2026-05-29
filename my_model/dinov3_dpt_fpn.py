@@ -230,6 +230,229 @@ class ViTMultiLayerFusionPyramidNeck(nn.Module):
         return self.build_pyramid_from_f32(f32, frames=frames)
 
 
+# ── Semantic-Anchor MFCE neck + top-down decoder ─────────────────────────
+
+class DepthwiseSeparableConvGNAct(nn.Module):
+    """Depthwise 3x3 convolution followed by pointwise projection."""
+
+    def __init__(self, in_ch: int, out_ch: int, dilation: int = 1):
+        super().__init__()
+        self.block = nn.Sequential(
+            nn.Conv2d(
+                in_ch,
+                in_ch,
+                kernel_size=3,
+                padding=dilation,
+                dilation=dilation,
+                groups=in_ch,
+                bias=False,
+            ),
+            nn.GroupNorm(get_gn_groups(in_ch), in_ch),
+            nn.GELU(),
+            nn.Conv2d(in_ch, out_ch, kernel_size=1, bias=False),
+            nn.GroupNorm(get_gn_groups(out_ch), out_ch),
+            nn.GELU(),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.block(x)
+
+
+class SemanticAnchorMFCE(nn.Module):
+    """MFCE-style spatial layer attention over same-resolution ViT features.
+
+    DINOv3 ViT layers are all native 1/16 token maps.  This module projects
+    each layer to a shared channel width, predicts a per-layer spatial score,
+    softmaxes over layer depth, and returns one fused P4 semantic anchor.
+    """
+
+    def __init__(
+        self,
+        in_ch: int = 1024,
+        out_ch: int = 256,
+        layers: tuple[int, ...] = (5, 11, 17, 23),
+        return_projected: bool = False,
+    ):
+        super().__init__()
+        if len(layers) <= 0:
+            raise ValueError("SemanticAnchorMFCE requires at least one ViT layer")
+        self.layer_indices = list(layers)
+        self.out_ch = out_ch
+        self.return_projected = bool(return_projected)
+
+        self.projections = nn.ModuleDict()
+        self.scores = nn.ModuleDict()
+        for idx in self.layer_indices:
+            self.projections[str(idx)] = nn.Sequential(
+                nn.Conv2d(in_ch, out_ch, kernel_size=1, bias=False),
+                nn.GroupNorm(get_gn_groups(out_ch), out_ch),
+                nn.GELU(),
+            )
+            self.scores[str(idx)] = nn.Conv2d(out_ch, 1, kernel_size=1)
+
+        self.refine = DepthwiseSeparableConvGNAct(out_ch, out_ch)
+
+    def forward(self, feats: dict[int, torch.Tensor]) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        missing = [idx for idx in self.layer_indices if idx not in feats]
+        if missing:
+            raise KeyError(f"Missing ViT feature layers for SemanticAnchorMFCE: {missing}")
+
+        projected: list[torch.Tensor] = []
+        scores: list[torch.Tensor] = []
+        for idx in self.layer_indices:
+            feat = feats[idx]
+            if feat.ndim != 4:
+                raise ValueError(
+                    f"SemanticAnchorMFCE expects flat [B*T,C,H,W] features, "
+                    f"got layer {idx} shape {tuple(feat.shape)}"
+                )
+            proj = self.projections[str(idx)](feat)
+            projected.append(proj)
+            scores.append(self.scores[str(idx)](proj))
+
+        score_stack = torch.stack(scores, dim=1)          # [BT,L,1,H,W]
+        layer_attn = torch.softmax(score_stack, dim=1)
+        fused = torch.zeros_like(projected[0])
+        for layer_idx, proj in enumerate(projected):
+            fused = fused + layer_attn[:, layer_idx] * proj
+        fused = self.refine(fused)
+
+        aux: dict[str, torch.Tensor] = {"layer_attn": layer_attn}
+        if self.return_projected:
+            aux["projected_feats"] = torch.stack(projected, dim=1)
+        return fused, aux
+
+
+class LightASPP(nn.Module):
+    """Light P4 context enhancement that returns context to the 1/16 anchor."""
+
+    def __init__(self, channels: int = 256, rates: tuple[int, ...] = (1, 2, 4, 8)):
+        super().__init__()
+        if len(rates) <= 0:
+            raise ValueError("LightASPP requires at least one dilation rate")
+        self.rates = tuple(int(rate) for rate in rates)
+        self.branches = nn.ModuleList([
+            DepthwiseSeparableConvGNAct(channels, channels, dilation=rate)
+            for rate in self.rates
+        ])
+        self.project = nn.Sequential(
+            nn.Conv2d(channels * len(self.rates), channels, kernel_size=1, bias=False),
+            nn.GroupNorm(get_gn_groups(channels), channels),
+            nn.GELU(),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.project(torch.cat([branch(x) for branch in self.branches], dim=1))
+
+
+class SemanticAnchorDetailStem(nn.Module):
+    """Light RGB detail stem for P3/P2/P1 skips only."""
+
+    def __init__(
+        self,
+        c1: int = 64,
+        c2: int = 128,
+        c3: int = 256,
+        gated: bool = True,
+        gate_init: float = -3.0,
+    ):
+        super().__init__()
+        self.gated = bool(gated)
+        self.stem1 = ConvGNAct(3, c1, stride=2)   # 512 -> 256
+        self.stem2 = ConvGNAct(c1, c2, stride=2)  # 256 -> 128
+        self.stem3 = ConvGNAct(c2, c3, stride=2)  # 128 -> 64
+        self.gate_p1 = nn.Parameter(torch.tensor(float(gate_init)))
+        self.gate_p2 = nn.Parameter(torch.tensor(float(gate_init)))
+        self.gate_p3 = nn.Parameter(torch.tensor(float(gate_init)))
+
+    def _apply_gate(self, x: torch.Tensor, gate: nn.Parameter) -> torch.Tensor:
+        if not self.gated:
+            return x
+        return torch.sigmoid(gate) * x
+
+    def forward(self, frames: torch.Tensor) -> dict[str, torch.Tensor]:
+        p1 = self.stem1(frames)
+        p2 = self.stem2(p1)
+        p3 = self.stem3(p2)
+        return {
+            "p1": self._apply_gate(p1, self.gate_p1),
+            "p2": self._apply_gate(p2, self.gate_p2),
+            "p3": self._apply_gate(p3, self.gate_p3),
+            "gate_p1": torch.sigmoid(self.gate_p1.detach()),
+            "gate_p2": torch.sigmoid(self.gate_p2.detach()),
+            "gate_p3": torch.sigmoid(self.gate_p3.detach()),
+        }
+
+
+class ConvFuseBlock(nn.Module):
+    """Fuse an upsampled top-down feature with an optional detail skip."""
+
+    def __init__(self, in_ch: int, out_ch: int):
+        super().__init__()
+        self.block = nn.Sequential(
+            ConvGNAct(in_ch, out_ch),
+            DepthwiseSeparableConvGNAct(out_ch, out_ch),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.block(x)
+
+
+class SemanticAnchorDecoder(nn.Module):
+    """Top-down decoder: P4 1/16 -> P3 1/8 -> P2 1/4 -> P1 1/2 -> logits."""
+
+    def __init__(
+        self,
+        c4: int = 256,
+        c3: int = 256,
+        c2: int = 128,
+        c1: int = 64,
+        out_channels: int = 1,
+    ):
+        super().__init__()
+        self.c3 = c3
+        self.c2 = c2
+        self.c1 = c1
+        self.p3_refine = ConvFuseBlock(c4 + c3, c3)
+        self.p2_refine = ConvFuseBlock(c3 + c2, c2)
+        self.p1_refine = ConvFuseBlock(c2 + c1, c1)
+        self.head = nn.Sequential(
+            DepthwiseSeparableConvGNAct(c1, c1),
+            nn.Conv2d(c1, out_channels, kernel_size=1),
+        )
+
+    @staticmethod
+    def _detail_or_zeros(
+        detail: dict[str, torch.Tensor] | None,
+        key: str,
+        channels: int,
+        ref: torch.Tensor,
+    ) -> torch.Tensor:
+        if detail is not None and key in detail:
+            return detail[key]
+        return ref.new_zeros(ref.shape[0], channels, ref.shape[-2], ref.shape[-1])
+
+    def forward(
+        self,
+        p4: torch.Tensor,
+        detail: dict[str, torch.Tensor] | None = None,
+    ) -> torch.Tensor:
+        x = F.interpolate(p4, scale_factor=2, mode="bilinear", align_corners=False)
+        x = torch.cat([x, self._detail_or_zeros(detail, "p3", self.c3, x)], dim=1)
+        x = self.p3_refine(x)
+
+        x = F.interpolate(x, scale_factor=2, mode="bilinear", align_corners=False)
+        x = torch.cat([x, self._detail_or_zeros(detail, "p2", self.c2, x)], dim=1)
+        x = self.p2_refine(x)
+
+        x = F.interpolate(x, scale_factor=2, mode="bilinear", align_corners=False)
+        x = torch.cat([x, self._detail_or_zeros(detail, "p1", self.c1, x)], dim=1)
+        x = self.p1_refine(x)
+
+        logits = self.head(x)
+        return F.interpolate(logits, scale_factor=2, mode="bilinear", align_corners=False)
+
+
 # ── FPN Decoder ──────────────────────────────────────────────────────────
 
 class FPNDecoder(nn.Module):
