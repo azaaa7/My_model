@@ -108,6 +108,128 @@ class DPTReassembleNeck(nn.Module):
         }
 
 
+# ── Fused 32×32 ViT pyramid neck ─────────────────────────────────────────
+
+class HighResolutionImageStem(nn.Module):
+    """Lightweight RGB stem that provides high-resolution P2/P3 texture skips."""
+
+    def __init__(self, out_ch: int = 256, mid_ch: int = 64, high_ch: int = 128):
+        super().__init__()
+        self.down1 = ConvGNAct(3, mid_ch, stride=2)        # 512 -> 256
+        self.down2 = ConvGNAct(mid_ch, high_ch, stride=2)  # 256 -> 128
+        self.proj2 = nn.Sequential(
+            nn.Conv2d(high_ch, out_ch, kernel_size=1, bias=False),
+            nn.GroupNorm(get_gn_groups(out_ch), out_ch),
+            nn.GELU(),
+            ConvGNAct(out_ch, out_ch),
+        )
+        self.down3 = ConvGNAct(out_ch, out_ch, stride=2)   # 128 -> 64
+
+    def forward(self, frames: torch.Tensor) -> dict[str, torch.Tensor]:
+        x = self.down1(frames)
+        x = self.down2(x)
+        s2 = self.proj2(x)
+        s3 = self.down3(s2)
+        return {"s2": s2, "s3": s3}
+
+
+class ViTMultiLayerFusionPyramidNeck(nn.Module):
+    """Fuse same-resolution ViT block maps at 32×32, then build an FPN pyramid.
+
+    Input:  dict {layer_idx: [N, 1024, 32, 32]} for layers such as
+            [5, 11, 17, 23].  The layer indices encode semantic depth only;
+            all spatial scales are created after fusion from the shared F32.
+    Output: dict with f32 and p2/p3/p4/p5.
+    """
+
+    def __init__(
+        self,
+        in_ch: int = 1024,
+        out_ch: int = 256,
+        layers: tuple[int, ...] = (5, 11, 17, 23),
+        use_image_stem_skip: bool = False,
+    ):
+        super().__init__()
+        if len(layers) <= 0:
+            raise ValueError("ViTMultiLayerFusionPyramidNeck requires at least one layer")
+
+        self.layer_indices = list(layers)
+        self.out_ch = out_ch
+        self.use_image_stem_skip = bool(use_image_stem_skip)
+
+        self.projections = nn.ModuleDict()
+        for idx in self.layer_indices:
+            self.projections[str(idx)] = nn.Sequential(
+                nn.Conv2d(in_ch, out_ch, kernel_size=1, bias=False),
+                nn.GroupNorm(get_gn_groups(out_ch), out_ch),
+                nn.GELU(),
+                ConvGNAct(out_ch, out_ch),
+            )
+
+        self.fuse = nn.Sequential(
+            nn.Conv2d(out_ch * len(self.layer_indices), out_ch, kernel_size=1, bias=False),
+            nn.GroupNorm(get_gn_groups(out_ch), out_ch),
+            nn.GELU(),
+            ConvGNAct(out_ch, out_ch),
+        )
+
+        self.p4_block = ConvGNAct(out_ch, out_ch)
+        self.p5_block = nn.Sequential(
+            ConvGNAct(out_ch, out_ch, stride=2),
+            ConvGNAct(out_ch, out_ch),
+        )
+        self.p3_block = ConvGNAct(out_ch, out_ch)
+        self.p2_block1 = ConvGNAct(out_ch, out_ch)
+        self.p2_block2 = ConvGNAct(out_ch, out_ch)
+
+        self.image_stem = HighResolutionImageStem(out_ch=out_ch) if self.use_image_stem_skip else None
+        self.stem2_scale = nn.Parameter(torch.tensor(0.0), requires_grad=self.use_image_stem_skip)
+        self.stem3_scale = nn.Parameter(torch.tensor(0.0), requires_grad=self.use_image_stem_skip)
+
+    def fuse_features(self, feats: dict[int, torch.Tensor]) -> torch.Tensor:
+        projected = []
+        missing = [idx for idx in self.layer_indices if idx not in feats]
+        if missing:
+            raise KeyError(f"Missing ViT feature layers for fused32 pyramid: {missing}")
+
+        for idx in self.layer_indices:
+            projected.append(self.projections[str(idx)](feats[idx]))
+        return self.fuse(torch.cat(projected, dim=1))
+
+    def build_pyramid_from_f32(
+        self,
+        f32: torch.Tensor,
+        frames: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor]:
+        p4 = self.p4_block(f32)
+        p5 = self.p5_block(f32)
+
+        p3 = F.interpolate(f32, scale_factor=2, mode="bilinear", align_corners=False)
+        p3 = self.p3_block(p3)
+
+        p2 = F.interpolate(f32, scale_factor=2, mode="bilinear", align_corners=False)
+        p2 = self.p2_block1(p2)
+        p2 = F.interpolate(p2, scale_factor=2, mode="bilinear", align_corners=False)
+        p2 = self.p2_block2(p2)
+
+        if self.image_stem is not None:
+            if frames is None:
+                raise ValueError("frames must be provided when use_image_stem_skip=True")
+            stem = self.image_stem(frames)
+            p2 = p2 + self.stem2_scale * stem["s2"]
+            p3 = p3 + self.stem3_scale * stem["s3"]
+
+        return {"f32": f32, "p2": p2, "p3": p3, "p4": p4, "p5": p5}
+
+    def forward(
+        self,
+        feats: dict[int, torch.Tensor],
+        frames: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor]:
+        f32 = self.fuse_features(feats)
+        return self.build_pyramid_from_f32(f32, frames=frames)
+
+
 # ── FPN Decoder ──────────────────────────────────────────────────────────
 
 class FPNDecoder(nn.Module):

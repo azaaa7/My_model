@@ -26,7 +26,7 @@ num_workers: 6
 
 # DINOv3 ViT-L/16 pretrained backbone.
 # Place the weight file in My_model/ or replace this with an absolute path.
-dinov3_weights: "./runs/dinov3_vitl16/dinov3_vitl16_pretrain_lvd1689m-8aa4cbdd.pth"
+dinov3_weights: "~/.cache/torch/hub/checkpoints/dinov3_vitl16_pretrain_lvd1689m-8aa4cbdd.pth"
 
 # Prefer a local clone of https://github.com/facebookresearch/dinov3.
 # If empty, the script checks ./dinov3, ../dinov3, and cwd/dinov3.

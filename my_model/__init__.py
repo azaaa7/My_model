@@ -1,4 +1,11 @@
-from .dinov3_dpt_fpn import ConvGNAct, DPTReassembleNeck, FPNDecoder, ReassembleBlock
+from .dinov3_dpt_fpn import (
+    ConvGNAct,
+    DPTReassembleNeck,
+    FPNDecoder,
+    HighResolutionImageStem,
+    ReassembleBlock,
+    ViTMultiLayerFusionPyramidNeck,
+)
 from .losses import (
     BoundaryLoss,
     DiceLoss,
@@ -26,6 +33,7 @@ __all__ = [
     "EdgeLoss",
     "FocalLoss",
     "FPNDecoder",
+    "HighResolutionImageStem",
     "InpaintMemoryAttention",
     "IoULoss",
     "LocalTemporalDifferenceModule",
@@ -35,6 +43,7 @@ __all__ = [
     "TemporalDeltaLoss",
     "TFCUInpaintAdapter",
     "TverskyLoss",
+    "ViTMultiLayerFusionPyramidNeck",
     "VideoInpaintTFCU",
     "WeightedBCELoss",
 ]

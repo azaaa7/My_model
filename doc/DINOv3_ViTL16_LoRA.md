@@ -11,8 +11,8 @@
 | 变体 | `use_dpt_fpn` | `use_tfcu_adapter` | 输入形状 | 说明 |
 |------|:---:|:---:|---|---|
 | **A — 单层 SimpleSegHead** | `false` | `false` | `[B,T,3,H,W]` | DINOv3-IML 风格，单层特征 + 3-conv 头 |
-| **B — 多层 DPT+FPN** | `true` | `false` | `[B,T,3,H,W]` | 4 层 DINO 特征 + DPT Neck + FPN Decoder |
-| **C — DPT+FPN + TFCU Adapter** | `true` | `true` | `[B,N,T,3,H,W]` | 变体 B + P4 时序 adapter（视频 inpainting 检测） |
+| **B — 多层 DPT+FPN** | `true` | `false` | `[B,T,3,H,W]` | 4 层 DINO 特征融合为 F32，再构建 FPN Decoder 输入 |
+| **C — DPT+FPN + TFCU Adapter** | `true` | `true` | `[B,N,T,3,H,W]` | 变体 B + F32 时序 adapter（视频 inpainting 检测） |
 
 下文按模块逐一说明。
 
@@ -43,7 +43,7 @@ clip [B, T, 3, 512, 512]          (变体 B)
 
 可配置提取层：
 ```yaml
-extract_layers: "11,15,19,23"   # 0-based block 索引，推荐深层
+extract_layers: "5,11,17,23"    # 0-based block 索引；空间分辨率同为 32×32
 ```
 
 ---
@@ -70,13 +70,23 @@ extract_layers: "11,15,19,23"   # 0-based block 索引，推荐深层
 | 激活 | ReLU |
 | 参数量 | ~1.6M |
 
-### 变体 B / C：DPT Reassemble Neck + FPN Decoder
+### 变体 B / C：Fused32 Pyramid Neck + FPN Decoder
+
+默认结构使用 `neck_variant: fused32_pyramid`。DINOv3 ViT 的多个 block 输出都是同一 token 分辨率，因此先在 32×32 上融合语义深度，再从 enhanced F32 构建 decoder pyramid：
 
 ```text
-DINO block 5  → ReassembleBlock("x4")    → P2 [*,256,128,128]
-DINO block 11 → ReassembleBlock("x2")    → P3 [*,256, 64, 64]
-DINO block 17 → ReassembleBlock("x1")    → P4 [*,256, 32, 32]
-DINO block 23 → ReassembleBlock("down2") → P5 [*,256, 16, 16]
+DINO block 5   → [*,1024,32,32]
+DINO block 11  → [*,1024,32,32]
+DINO block 17  → [*,1024,32,32]
+DINO block 23  → [*,1024,32,32]
+        ↓ 1×1 projection 到 neck_channels
+        ↓ concat + fusion
+F32 [*,256,32,32]
+        ↓
+P5 = downsample(F32) → [*,256, 16, 16]
+P4 = conv(F32)       → [*,256, 32, 32]
+P3 = upsample(F32)   → [*,256, 64, 64]
+P2 = upsample(F32)   → [*,256,128,128]
 
 FPN top-down fusion:
   P5 → F5
@@ -89,7 +99,7 @@ F2 (128×128) → upsample → Conv(256→128) @ 256×256
              → Conv(64→32) → Conv2d(32→1)  →  [*,1,512,512]
 ```
 
-每个 ReassembleBlock = `1×1 Conv → GN → GELU → (upsample+conv 组合)`。
+旧结构仍可通过 `neck_variant: dpt_reassemble` 回退。旧结构里 `DPTReassembleNeck` 会把不同 block 直接重组为 P2/P3/P4/P5，但这不再是推荐默认。
 每个 FPN ConvBlock = `Conv3×3 → GroupNorm → GELU`。
 
 ### 输出
@@ -103,23 +113,24 @@ F2 (128×128) → upsample → Conv(256→128) @ 256×256
 
 ## 四、TFCU-Inpaint Adapter（变体 C 专属）
 
-变体 C 在 FPN P4 层级插入一个轻量级时序模块，用于视频 inpainting 检测。
+变体 C 默认在 fused F32 层级插入一个轻量级时序模块，用于视频 inpainting 检测。后续 MaskPromptEncoder 也应接在同一个 F32 插入点，而不是 P4/P5。
 
 ### 核心原则
 
 - **不重写 backbone** — 复用现有 DINOv3+LoRA+DPT-FPN，以 residual 方式注入。
 - **causal memory** — 当前 clip 只能看到过去的 clip，绝不泄露未来信息。
 - **可退化** — 残差系数 α 初始化为 0，模型等价于原始单帧 backbone，避免训练初期崩溃。
+- **统一插入点** — temporal/prompt 作用于 F32；P2/P3/P4/P5 由 enhanced F32 统一生成。
 
 ### 数据流
 
 ```text
 video [B, N, T, 3, 512, 512]
   → flatten  [B*N*T, 3, 512, 512]
-  → DINOv3 + LoRA → DPT Neck
-  → P2, P3, P4, P5  (P4: [BNT, 256, 32, 32])
+  → DINOv3 + LoRA → ViTMultiLayerFusionPyramidNeck
+  → F32 [BNT, 256, 32, 32]
 
-  ┌─ TFCUInpaintAdapter(P4, B, N, T) ─────────────────────┐
+  ┌─ TFCUInpaintAdapter(F32, B, N, T) ────────────────────┐
   │  1. LocalTemporalDifferenceModule                      │
   │     每帧与前一帧做差 → 门控融合 → 捕捉纹理/边界不一致     │
   │                                                        │
@@ -129,10 +140,11 @@ video [B, N, T, 3, 512, 512]
   │     clip 2 ← attend(mem_0, mem_1) → mem_2              │
   │     ...                                                │
   │                                                        │
-  │  3. P4_out = P4 + α * temporal_feat    (α 初始 = 0)    │
+  │  3. F32_out = F32 + α * temporal_feat  (α 初始 = 0)    │
   └────────────────────────────────────────────────────────┘
 
-  → FPNDecoder(P2, P3, P4_out, P5)
+  → build P2/P3/P4/P5 from enhanced F32
+  → FPNDecoder(P2, P3, P4, P5)
   → logits [B, N, T, 1, 512, 512]
 ```
 
@@ -142,14 +154,17 @@ video [B, N, T, 3, 512, 512]
 |------|------|------|
 | `LocalTemporalDifferenceModule` | `my_model/temporal/local_temporal_difference.py` | 计算帧间差分 (x_t − x_{t-1}) → 门控融合 |
 | `InpaintMemoryAttention` | `my_model/temporal/memory_attention.py` | 前向历史 memory 多头交叉注意力 + FFN |
-| `TFCUInpaintAdapter` | `my_model/temporal/temporal_adapter.py` | 总入口：local diff → causal memory → residual P4 |
-| `MaskPromptEncoder` | `my_model/temporal/mask_prompt_encoder.py` | mask/boundary prompt 编码（备用，当前未启用） |
+| `TFCUInpaintAdapter` | `my_model/temporal/temporal_adapter.py` | 总入口：local diff → causal memory → residual F32 |
+| `MaskPromptEncoder` | `my_model/temporal/mask_prompt_encoder.py` | mask/boundary prompt 编码（备用，后续接入 F32） |
 | `VideoInpaintTFCU` | `my_model/video_inpaint_tfcu.py` | 顶层 wrapper，封装 base backbone + adapter |
 
 ### TFCU 关键配置
 
 ```yaml
 use_tfcu_adapter: true       # 启用 TFCU adapter
+neck_variant: fused32_pyramid
+temporal_insert_level: F32
+use_image_stem_skip: false   # 可选 RGB stem skip，默认关闭
 num_clips: 4                 # 每个视频采样的 clip 数 (N)
 num_frames: 4                # 每个 clip 内的帧数 (T)
 clip_stride: 1               # clip 内部帧间隔
@@ -269,7 +284,7 @@ loss:
 |---|---|---|
 | DINOv3 backbone | ~304M | ❄️ 冻结 |
 | LoRA (attn+mlp) | ~6M | 🔥 训练 |
-| DPTReassembleNeck | ~3.7M | 🔥 训练 |
+| ViTMultiLayerFusionPyramidNeck | 依 layers/channel 而定 | 🔥 训练 |
 | FPNDecoder | ~1.3M | 🔥 训练 |
 | **总计** | **~11M** | |
 
@@ -288,7 +303,7 @@ loss:
 |---|---|---|
 | DINOv3 backbone | ~304M | ❄️ 冻结 |
 | LoRA (attn+mlp) | ~6M | 🔥 训练 |
-| DPTReassembleNeck | ~3.7M | 🔥 训练 |
+| ViTMultiLayerFusionPyramidNeck | 依 layers/channel 而定 | 🔥 训练 |
 | FPNDecoder | ~1.3M | 🔥 训练 |
 | TFCUInpaintAdapter | ~2.2M | 🆕 🔥 训练 |
 | **总计** | **~13.2M** | |
@@ -321,6 +336,23 @@ python train_val_test_dinov3_lora.py \
   --grad_accum_steps 8
 ```
 
+### 多卡训练 / 分布式验证
+
+```bash
+# 8 卡 DDP 训练。每卡 batch_size=1，全局等效 batch = 8 × 1 × grad_accum_steps。
+torchrun --nproc_per_node=8 train_val_test_dinov3_lora.py \
+  --config configs/dinov3_vitl16_lora_tfcu_inpaint.yml \
+  --type train \
+  --batch_size 1 \
+  --grad_accum_steps 1
+
+# 多卡验证/测试也会按 rank 切分样本并 all-reduce 指标。
+torchrun --nproc_per_node=8 train_val_test_dinov3_lora.py \
+  --config configs/dinov3_vitl16_lora_tfcu_inpaint.yml \
+  --type test \
+  --checkpoint runs/dinov3_vitl16_tfcu_inpaint_new_decoder/best_iou.pt
+```
+
 ### 验证 / 测试
 
 ```bash
@@ -341,6 +373,8 @@ python train_val_test_dinov3_lora.py \
 
 ```bash
 --gpu_id 1                    # 选择 GPU
+--dist_backend nccl           # torchrun 多卡后端
+--ddp_find_unused_parameters false
 --batch_size 8                # 调整 batch size
 --grad_accum_steps 2          # 梯度累积（等效 batch = batch_size × grad_accum_steps）
 --eval_frame_chunk 5          # 测试时分块前向，降低显存
@@ -436,11 +470,14 @@ use_tfcu_adapter: false
 # 变体 B — 多层 DPT+FPN
 use_dpt_fpn: true
 use_tfcu_adapter: false
-extract_layers: "11,15,19,23"
+neck_variant: fused32_pyramid
+extract_layers: "5,11,17,23"
 
 # 变体 C — DPT+FPN + TFCU Adapter
 use_dpt_fpn: true
 use_tfcu_adapter: true
+neck_variant: fused32_pyramid
+temporal_insert_level: F32
 num_clips: 4
 num_frames: 4
 ```
@@ -473,7 +510,7 @@ My_model/
 │   ├── __init__.py                        # 模块导出
 │   ├── losses.py                          # 所有损失函数（含 Boundary / TemporalDelta）
 │   ├── metrics.py                         # IoU/F1 等评估指标
-│   ├── dinov3_dpt_fpn.py                  # DPTReassembleNeck / FPNDecoder
+│   ├── dinov3_dpt_fpn.py                  # Fused32/DPT necks / FPNDecoder
 │   ├── video_inpaint_tfcu.py              # VideoInpaintTFCU wrapper
 │   └── temporal/
 │       ├── __init__.py

@@ -1,1 +1,20 @@
 runs/
+**/runs/
+
+# Model weights and checkpoints
+*.pth
+*.pt
+*.ckpt
+*.safetensors
+*.bin
+dinov3/dinov3_weight/
+dinov3_weight/
+**/dinov3_weight/
+
+# Python/cache artifacts
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Local logs
+*.log

@@ -1,20 +1,30 @@
 from __future__ import annotations
 
 import argparse
+import builtins
 import json
 import os
 import warnings
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.nn.parallel import DistributedDataParallel
 from torch.optim import Adam
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, ReduceLROnPlateau, SequentialLR
 
+try:
+    from torch.distributed.elastic.multiprocessing.errors import record
+except ImportError:
+    def record(fn):
+        return fn
+
 from my_model import SegmentationLoss, VideoInpaintTFCU
-from my_model.dinov3_dpt_fpn import DPTReassembleNeck, FPNDecoder
+from my_model.dinov3_dpt_fpn import DPTReassembleNeck, FPNDecoder, ViTMultiLayerFusionPyramidNeck
 from my_model.metrics import AverageMeter, binary_metrics_from_logits, set_seed
 from train_val_test_convnext_lora import (
     count_parameters,
@@ -37,6 +47,51 @@ DINOV3_WEIGHT_NAME = "dinov3_vitl16_pretrain_lvd1689m-8aa4cbdd.pth"
 DINOV3_FEATURE_DIM = 1024
 DINOV3_PATCH_SIZE = 16
 DEFAULT_LORA_TARGETS = ("attn.qkv", "attn.proj")
+
+
+def is_dist_avail_and_initialized() -> bool:
+    return dist.is_available() and dist.is_initialized()
+
+
+def is_main_process() -> bool:
+    return not is_dist_avail_and_initialized() or dist.get_rank() == 0
+
+
+def setup_for_distributed(is_master: bool) -> None:
+    builtin_print = builtins.print
+
+    def print(*args, **kwargs):
+        force = kwargs.pop("force", False)
+        if is_master or force:
+            builtin_print(*args, **kwargs)
+
+    builtins.print = print
+
+
+def init_distributed_mode(cfg: dict[str, Any]) -> tuple[bool, int, int, int]:
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    rank = int(os.environ.get("RANK", "0"))
+    local_rank = int(os.environ.get("LOCAL_RANK", str(cfg.get("gpu_id", 0))))
+
+    distributed = world_size > 1
+    if not distributed:
+        setup_for_distributed(True)
+        return False, 0, local_rank, 1
+
+    if not torch.cuda.is_available():
+        raise RuntimeError("DDP training requires CUDA devices")
+
+    torch.cuda.set_device(local_rank)
+    backend = str(cfg.get("dist_backend", "nccl"))
+    dist.init_process_group(backend=backend, init_method="env://")
+    dist.barrier()
+    setup_for_distributed(rank == 0)
+    return True, rank, local_rank, world_size
+
+
+def cleanup_distributed() -> None:
+    if is_dist_avail_and_initialized():
+        dist.destroy_process_group()
 
 
 def split_path_list(value: Any) -> list[str]:
@@ -243,7 +298,8 @@ class DinoSingleLayerEncoder(nn.Module):
         frames = video.reshape(B * T, C, H, W)
         normalized = (frames - self.image_mean) / self.image_std
 
-        with torch.set_grad_enabled(not (self.freeze_backbone and not self.use_lora)):
+        grad_enabled = torch.is_grad_enabled() and not (self.freeze_backbone and not self.use_lora)
+        with torch.set_grad_enabled(grad_enabled):
             layer_outputs = self.backbone.get_intermediate_layers(
                 normalized, n=[self.last_layer_idx], reshape=True, norm=True
             )
@@ -313,7 +369,7 @@ class DinoMultiLayerEncoder(nn.Module):
     """Extract multiple DINOv3 block patch token outputs for DPT neck.
 
     Extracts token maps from specified ViT blocks (all at 32×32, 1024-dim),
-    suitable as input to DPTReassembleNeck.
+    suitable as input to DPTReassembleNeck or ViTMultiLayerFusionPyramidNeck.
 
     Args:
         backbone: DINOv3 VisionTransformer (with LoRA already injected)
@@ -353,7 +409,8 @@ class DinoMultiLayerEncoder(nn.Module):
         frames = video.reshape(B * T, C, H, W)
         normalized = (frames - self.image_mean) / self.image_std
 
-        with torch.set_grad_enabled(not (self.freeze_backbone and not self.use_lora)):
+        grad_enabled = torch.is_grad_enabled() and not (self.freeze_backbone and not self.use_lora)
+        with torch.set_grad_enabled(grad_enabled):
             layer_outputs = self.backbone.get_intermediate_layers(
                 normalized, n=self.extract_layers, reshape=True, norm=True,
             )
@@ -395,6 +452,8 @@ class DINOv3ViTL16InpaintingDetector(nn.Module):
         use_dpt_fpn: bool = False,
         extract_layers: tuple[int, ...] = (5, 11, 17, 23),
         neck_channels: int = 256,
+        neck_variant: str = "fused32_pyramid",
+        use_image_stem_skip: bool = False,
         lora_block_indices: list[int] | None = None,
     ):
         super().__init__()
@@ -402,6 +461,8 @@ class DINOv3ViTL16InpaintingDetector(nn.Module):
         self.freeze_backbone = freeze_backbone
         self.use_lora = use_lora
         self.use_dpt_fpn = use_dpt_fpn
+        self.neck_variant = str(neck_variant).strip().lower()
+        self.use_image_stem_skip = bool(use_image_stem_skip)
 
         # LoRA injection (before freezing so LoRA params stay trainable)
         self.lora_layers = 0
@@ -431,6 +492,12 @@ class DINOv3ViTL16InpaintingDetector(nn.Module):
                         param.requires_grad = True
 
         if use_dpt_fpn:
+            if self.neck_variant not in {"dpt_reassemble", "fused32_pyramid"}:
+                raise ValueError(
+                    f"Unknown neck_variant '{neck_variant}'. "
+                    "Use 'dpt_reassemble' or 'fused32_pyramid'."
+                )
+
             # Multi-layer encoder → DPT neck → FPN decoder
             self.encoder = DinoMultiLayerEncoder(
                 backbone=self.backbone,
@@ -438,11 +505,19 @@ class DINOv3ViTL16InpaintingDetector(nn.Module):
                 freeze_backbone=freeze_backbone,
                 use_lora=use_lora,
             )
-            self.neck = DPTReassembleNeck(
-                in_ch=DINOV3_FEATURE_DIM,
-                out_ch=neck_channels,
-                layers=extract_layers,
-            )
+            if self.neck_variant == "fused32_pyramid":
+                self.neck = ViTMultiLayerFusionPyramidNeck(
+                    in_ch=DINOV3_FEATURE_DIM,
+                    out_ch=neck_channels,
+                    layers=extract_layers,
+                    use_image_stem_skip=self.use_image_stem_skip,
+                )
+            else:
+                self.neck = DPTReassembleNeck(
+                    in_ch=DINOV3_FEATURE_DIM,
+                    out_ch=neck_channels,
+                    layers=extract_layers,
+                )
             self.decoder = FPNDecoder(channels=neck_channels)
             self.extract_layers = list(extract_layers)
         else:
@@ -468,8 +543,10 @@ class DINOv3ViTL16InpaintingDetector(nn.Module):
         if self.use_dpt_fpn:
             # Flatten [B,T,3,H,W] → [B*T,3,H,W] before feature extraction
             frames = clip.reshape(batch_size * num_frames, channels, height, width)
-            P2, P3, P4, P5 = self.extract_fpn_features(frames)
-            logits = self.decode_fpn(P2, P3, P4, P5)
+            features = self.extract_pyramid_features(frames, return_f32=False)
+            logits = self.decode_fpn(
+                features["p2"], features["p3"], features["p4"], features["p5"],
+            )
             logits = logits.reshape(batch_size, num_frames, 1, height, width)
             return logits
         else:
@@ -487,6 +564,54 @@ class DINOv3ViTL16InpaintingDetector(nn.Module):
     # ------------------------------------------------------------------
     # Public API for TFCU-Inpaint wrapper
     # ------------------------------------------------------------------
+
+    def extract_pyramid_features(
+        self,
+        frames: torch.Tensor,
+        *,
+        return_f32: bool = False,
+    ) -> dict[str, torch.Tensor]:
+        """Extract FPN pyramid, optionally including fused F32.
+
+        Args:
+            frames: [B_flat, 3, H, W]
+            return_f32: include ``features["f32"]`` for fused32_pyramid.
+        """
+        if not self.use_dpt_fpn:
+            raise RuntimeError("extract_pyramid_features requires use_dpt_fpn=True")
+
+        feats = self.encoder(frames[:, None])  # {layer: [B, 1, 1024, 32, 32]}
+        feats_flat = {k: v[:, 0] for k, v in feats.items()}
+
+        if self.neck_variant == "fused32_pyramid":
+            pyramid = self.neck(feats_flat, frames=frames)
+            if not return_f32:
+                pyramid = {k: v for k, v in pyramid.items() if k != "f32"}
+            return pyramid
+
+        pyramid = self.neck(feats_flat)
+        if return_f32:
+            raise RuntimeError("return_f32=True requires neck_variant=fused32_pyramid")
+        return pyramid
+
+    def build_pyramid_from_f32(
+        self,
+        f32: torch.Tensor,
+        *,
+        original_features: dict[str, torch.Tensor] | None = None,
+        frames: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor]:
+        """Build decoder pyramid from enhanced F32 for fused32_pyramid."""
+        if not self.use_dpt_fpn:
+            raise RuntimeError("build_pyramid_from_f32 requires use_dpt_fpn=True")
+        if self.neck_variant != "fused32_pyramid":
+            raise RuntimeError("build_pyramid_from_f32 requires neck_variant=fused32_pyramid")
+        pyramid = self.neck.build_pyramid_from_f32(f32, frames=frames)
+        if original_features is not None:
+            for key in ("video_id", "window_id", "frame_indices", "valid_mask"):
+                if key in original_features:
+                    pyramid[key] = original_features[key]
+        return pyramid
 
     def extract_fpn_features(
         self, frames: torch.Tensor,
@@ -506,11 +631,7 @@ class DINOv3ViTL16InpaintingDetector(nn.Module):
             raise RuntimeError(
                 "extract_fpn_features requires use_dpt_fpn=True"
             )
-        # DinoMultiLayerEncoder expects [B, T, 3, H, W]; pass flat frames
-        # with a singleton T dim then squeeze.
-        feats = self.encoder(frames[:, None])  # {layer: [B, 1, 1024, 32, 32]}
-        feats_flat = {k: v[:, 0] for k, v in feats.items()}
-        pyramid = self.neck(feats_flat)
+        pyramid = self.extract_pyramid_features(frames, return_f32=False)
         return pyramid["p2"], pyramid["p3"], pyramid["p4"], pyramid["p5"]
 
     def decode_fpn(
@@ -538,6 +659,10 @@ def validate_config(cfg: dict[str, Any], mode: str) -> None:
     use_tfcu = bool(cfg.get("use_tfcu_adapter", False))
     num_frames = int(cfg.get("num_frames", 0))
     num_clips = int(cfg.get("num_clips", 1))
+    neck_variant = str(cfg.get("neck_variant", "fused32_pyramid")).strip().lower()
+    temporal_insert_level = str(
+        cfg.get("temporal_insert_level", "F32" if neck_variant == "fused32_pyramid" else "P4")
+    ).strip().upper()
 
     if mode not in {"train", "val", "test"}:
         errors.append(f"type must be train/val/test, got {mode}")
@@ -549,6 +674,12 @@ def validate_config(cfg: dict[str, Any], mode: str) -> None:
         errors.append("batch_size must be > 0")
     if int(cfg.get("grad_accum_steps", 1)) <= 0:
         errors.append("grad_accum_steps must be > 0")
+    if neck_variant not in {"dpt_reassemble", "fused32_pyramid"}:
+        errors.append("neck_variant must be dpt_reassemble or fused32_pyramid")
+    if neck_variant == "fused32_pyramid" and temporal_insert_level != "F32":
+        errors.append("neck_variant=fused32_pyramid requires temporal_insert_level=F32")
+    if neck_variant == "dpt_reassemble" and temporal_insert_level != "P4":
+        errors.append("neck_variant=dpt_reassemble requires temporal_insert_level=P4")
 
     if use_tfcu:
         if num_frames <= 0:
@@ -599,6 +730,7 @@ def build_model(cfg: dict[str, Any], device: torch.device, base_dir: Path) -> nn
     else:
         extract_layers = tuple(int(x.strip()) for x in str(extract_layers_str).split(",") if x.strip())
     neck_channels = int(cfg.get("neck_channels", 256))
+    neck_variant = str(cfg.get("neck_variant", "fused32_pyramid")).strip().lower()
     lora_block_indices = parse_lora_layers(cfg.get("lora_layers", "all"))
     use_tfcu_adapter = bool(cfg.get("use_tfcu_adapter", False))
 
@@ -616,6 +748,8 @@ def build_model(cfg: dict[str, Any], device: torch.device, base_dir: Path) -> nn
         use_dpt_fpn=use_dpt_fpn,
         extract_layers=extract_layers,
         neck_channels=neck_channels,
+        neck_variant=neck_variant,
+        use_image_stem_skip=bool(cfg.get("use_image_stem_skip", False)),
         lora_block_indices=lora_block_indices,
     )
 
@@ -649,7 +783,9 @@ def build_model(cfg: dict[str, Any], device: torch.device, base_dir: Path) -> nn
             print(f"[temporal] num_clips={int(cfg.get('num_clips', 4))} "
                   f"num_frames={int(cfg.get('num_frames', 1))} "
                   f"memory_len={int(cfg.get('memory_len', 4))} "
-                  f"use_memory={bool(cfg.get('use_memory', True))}")
+                  f"use_memory={bool(cfg.get('use_memory', True))} "
+                  f"insert={cfg.get('temporal_insert_level', 'F32')} "
+                  f"neck={cfg.get('neck_variant', 'fused32_pyramid')}")
             return model.to(device)
         else:
             missing, unexpected = base_model.load_state_dict(state_dict, strict=False)
@@ -669,11 +805,13 @@ def build_model(cfg: dict[str, Any], device: torch.device, base_dir: Path) -> nn
         print(f"[temporal] num_clips={int(cfg.get('num_clips', 4))} "
               f"num_frames={int(cfg.get('num_frames', 1))} "
               f"memory_len={int(cfg.get('memory_len', 4))} "
-              f"use_memory={bool(cfg.get('use_memory', True))}")
+              f"use_memory={bool(cfg.get('use_memory', True))} "
+              f"insert={cfg.get('temporal_insert_level', 'F32')} "
+              f"neck={cfg.get('neck_variant', 'fused32_pyramid')}")
         return model.to(device)
 
     total, trainable = count_parameters(base_model)
-    tag = "DPT+FPN" if use_dpt_fpn else "single-layer"
+    tag = f"DPT+FPN/{neck_variant}" if use_dpt_fpn else "single-layer"
     print(f"[model] DINOv3 ViT-L/16 {tag} encoder, LoRA layers: {base_model.lora_layers}")
     print(f"[params] total {total:,} trainable {trainable:,}")
     return base_model.to(device)
@@ -707,6 +845,22 @@ def build_meters(active_loss_names: list[str]) -> dict[str, AverageMeter]:
     for key in METRIC_KEYS:
         meters[key] = AverageMeter()
     return meters
+
+
+def reduce_meters(meters: dict[str, AverageMeter], device: torch.device) -> None:
+    if not is_dist_avail_and_initialized():
+        return
+
+    keys = list(meters.keys())
+    stats = torch.tensor(
+        [[meters[key].total, float(meters[key].count)] for key in keys],
+        dtype=torch.float64,
+        device=device,
+    )
+    dist.all_reduce(stats, op=dist.ReduceOp.SUM)
+    for idx, key in enumerate(keys):
+        meters[key].total = float(stats[idx, 0].item())
+        meters[key].count = int(stats[idx, 1].item())
 
 
 def summarize_samples(value: Any) -> str:
@@ -845,8 +999,10 @@ def run_epoch(
     visualization_dir: Path | None = None,
     grad_accum_steps: int = 1,
     eval_frame_chunk: int = 0,
+    rank: int = 0,
 ) -> dict[str, float]:
     is_train = mode == "train"
+    grad_accum_steps = max(1, int(grad_accum_steps))
     model.train(is_train)
 
     meters = build_meters(criterion.active_names)
@@ -874,50 +1030,55 @@ def run_epoch(
         # TFCU mode: never chunk temporal dim — the adapter needs all frames.
         _eval_chunk = 0 if use_tfcu else eval_frame_chunk
 
-        with torch.set_grad_enabled(is_train):
-            with torch.cuda.amp.autocast(enabled=amp and device.type == "cuda"):
-                logits_all = model(frames) if is_train else forward_in_frame_chunks(model, frames, _eval_chunk)
+        should_step = not is_train or step % grad_accum_steps == 0 or step == len(loader)
+        sync_context = nullcontext()
+        if is_train and isinstance(model, DistributedDataParallel) and not should_step:
+            sync_context = model.no_sync()
 
-                if use_tfcu:
-                    # TFCU mode: keep [B,N,T,1,H,W] so temporal losses
-                    # (temporal_delta, boundary) can access the T dimension.
-                    logits = logits_all
-                    loss_masks = masks
-                    # Align spatial dims (val masks may differ from 512×512)
-                    if logits.shape[-2:] != loss_masks.shape[-2:]:
-                        B_, N_, T_ = logits.shape[:3]
-                        logits = F.interpolate(
-                            logits.reshape(B_ * N_ * T_, 1, *logits.shape[-2:]),
-                            size=loss_masks.shape[-2:],
-                            mode="bilinear", align_corners=False,
-                        ).reshape(B_, N_, T_, 1, *loss_masks.shape[-2:])
-                else:
-                    logits, loss_masks = align_logits_and_masks(logits_all, masks)
+        with sync_context:
+            with torch.set_grad_enabled(is_train):
+                with torch.cuda.amp.autocast(enabled=amp and device.type == "cuda"):
+                    logits_all = model(frames) if is_train else forward_in_frame_chunks(model, frames, _eval_chunk)
 
-                if mode in ("val", "test") and use_tfcu and valid_mask is not None:
-                    loss, loss_items = _criterion_on_valid_tfcu_frames(
-                        criterion,
-                        logits,
-                        loss_masks,
-                        valid_mask,
-                    )
-                else:
-                    loss, loss_items = criterion(logits, loss_masks)
+                    if use_tfcu:
+                        # TFCU mode: keep [B,N,T,1,H,W] so temporal losses
+                        # (temporal_delta, boundary) can access the T dimension.
+                        logits = logits_all
+                        loss_masks = masks
+                        # Align spatial dims (val masks may differ from 512×512)
+                        if logits.shape[-2:] != loss_masks.shape[-2:]:
+                            B_, N_, T_ = logits.shape[:3]
+                            logits = F.interpolate(
+                                logits.reshape(B_ * N_ * T_, 1, *logits.shape[-2:]),
+                                size=loss_masks.shape[-2:],
+                                mode="bilinear", align_corners=False,
+                            ).reshape(B_, N_, T_, 1, *loss_masks.shape[-2:])
+                    else:
+                        logits, loss_masks = align_logits_and_masks(logits_all, masks)
 
-            if is_train:
-                scaled_loss = loss / grad_accum_steps
-                should_step = step % grad_accum_steps == 0 or step == len(loader)
-                if scaler is not None and amp and device.type == "cuda":
-                    scaler.scale(scaled_loss).backward()
-                    if should_step:
-                        scaler.step(optimizer)
-                        scaler.update()
-                        optimizer.zero_grad(set_to_none=True)
-                else:
-                    scaled_loss.backward()
-                    if should_step:
-                        optimizer.step()
-                        optimizer.zero_grad(set_to_none=True)
+                    if mode in ("val", "test") and use_tfcu and valid_mask is not None:
+                        loss, loss_items = _criterion_on_valid_tfcu_frames(
+                            criterion,
+                            logits,
+                            loss_masks,
+                            valid_mask,
+                        )
+                    else:
+                        loss, loss_items = criterion(logits, loss_masks)
+
+                if is_train:
+                    scaled_loss = loss / grad_accum_steps
+                    if scaler is not None and amp and device.type == "cuda":
+                        scaler.scale(scaled_loss).backward()
+                        if should_step:
+                            scaler.step(optimizer)
+                            scaler.update()
+                            optimizer.zero_grad(set_to_none=True)
+                    else:
+                        scaled_loss.backward()
+                        if should_step:
+                            optimizer.step()
+                            optimizer.zero_grad(set_to_none=True)
 
         metric_logits = logits.detach()
         metric_masks = loss_masks.detach()
@@ -930,25 +1091,38 @@ def run_epoch(
         for key, value in {**loss_items, **metric_items}.items():
             meters[key].update(value, meter_weight)
 
-        if visualization_dir is not None and not is_train and step <= 50:
+        if visualization_dir is not None and not is_train and step <= 50 and rank == 0:
             save_visualization(frames, logits_all.detach(), masks, names, visualization_dir, threshold, max_items=frames.shape[0])
 
-        if is_train and (step == 1 or step % 20 == 0):
+        if rank == 0 and is_train and (step == 1 or step % 20 == 0):
             print(
                 f"[train] step {step:04d}/{len(loader):04d} "
                 f"loss {meters['loss'].avg:.4f} iou {meters['iou'].avg:.4f} f1 {meters['f1'].avg:.4f}"
             )
 
+    reduce_meters(meters, device)
     return {key: meter.avg for key, meter in meters.items()}
 
 
-def train(cfg: dict[str, Any], device: torch.device, base_dir: Path) -> None:
+def train(
+    cfg: dict[str, Any],
+    device: torch.device,
+    base_dir: Path,
+    *,
+    distributed: bool = False,
+    rank: int = 0,
+    world_size: int = 1,
+) -> None:
     save_dir = Path(cfg["save_dir"])
-    save_dir.mkdir(parents=True, exist_ok=True)
-    with open(save_dir / "config.json", "w", encoding="utf-8") as f:
-        json.dump(cfg, f, indent=2, ensure_ascii=False)
+    if rank == 0:
+        save_dir.mkdir(parents=True, exist_ok=True)
+        with open(save_dir / "config.json", "w", encoding="utf-8") as f:
+            json.dump(cfg, f, indent=2, ensure_ascii=False)
+    if distributed:
+        dist.barrier()
 
     model = build_model(cfg, device, base_dir)
+    model_without_ddp = model
     criterion = SegmentationLoss(loss_cfg=cfg.get("loss", {}))
     log_fields = build_log_fields(criterion.active_names)
     log_path = save_dir / "log.txt"
@@ -964,18 +1138,19 @@ def train(cfg: dict[str, Any], device: torch.device, base_dir: Path) -> None:
             resume_epoch = state.get("epoch", 0)
             best_iou = state.get("metrics", {}).get("iou", -1.0)
 
-    if log_path.exists() and resume_epoch > 0:
-        print(f"[log] resuming — appending to {log_path} (epoch {resume_epoch}, best_iou={best_iou:.4f})")
-    else:
-        init_training_log(log_path, cfg, model, criterion)
-        print(f"[log] writing training metrics to {log_path}")
-    print(f"[loss] active: {criterion.active_names}")
+    if rank == 0:
+        if log_path.exists() and resume_epoch > 0:
+            print(f"[log] resuming — appending to {log_path} (epoch {resume_epoch}, best_iou={best_iou:.4f})")
+        else:
+            init_training_log(log_path, cfg, model_without_ddp, criterion)
+            print(f"[log] writing training metrics to {log_path}")
+        print(f"[loss] active: {criterion.active_names}")
 
     use_tfcu = bool(cfg.get("use_tfcu_adapter", False))
     base_lr = float(cfg["learning_rate"])
     wd = float(cfg.get("weight_decay", 0.0))
 
-    if use_tfcu and isinstance(model, VideoInpaintTFCU):
+    if use_tfcu and isinstance(model_without_ddp, VideoInpaintTFCU):
         # ── separate LR per component ────────────────────────────────
         lr_temporal = float(cfg.get("lr_temporal", base_lr))
         lr_decoder = float(cfg.get("lr_decoder", base_lr))
@@ -984,7 +1159,7 @@ def train(cfg: dict[str, Any], device: torch.device, base_dir: Path) -> None:
         param_groups: list[dict] = []
 
         # Temporal adapter
-        temporal_params = list(model.temporal_adapter.parameters())
+        temporal_params = [p for p in model_without_ddp.temporal_adapter.parameters() if p.requires_grad]
         if temporal_params:
             param_groups.append({
                 "params": temporal_params,
@@ -994,10 +1169,10 @@ def train(cfg: dict[str, Any], device: torch.device, base_dir: Path) -> None:
 
         # Decoder (base.decoder + base.neck)
         decoder_params = []
-        if hasattr(model.base, "decoder"):
-            decoder_params.extend(model.base.decoder.parameters())
-        if hasattr(model.base, "neck") and model.base.neck is not None:
-            decoder_params.extend(model.base.neck.parameters())
+        if hasattr(model_without_ddp.base, "decoder"):
+            decoder_params.extend(p for p in model_without_ddp.base.decoder.parameters() if p.requires_grad)
+        if hasattr(model_without_ddp.base, "neck") and model_without_ddp.base.neck is not None:
+            decoder_params.extend(p for p in model_without_ddp.base.neck.parameters() if p.requires_grad)
         if decoder_params:
             param_groups.append({
                 "params": decoder_params,
@@ -1007,7 +1182,7 @@ def train(cfg: dict[str, Any], device: torch.device, base_dir: Path) -> None:
 
         # LoRA / backbone trainable params (everything else)
         managed = set(id(p) for g in param_groups for p in g["params"])
-        other_params = [p for p in model.parameters() if p.requires_grad and id(p) not in managed]
+        other_params = [p for p in model_without_ddp.parameters() if p.requires_grad and id(p) not in managed]
         if other_params:
             param_groups.append({
                 "params": other_params,
@@ -1021,7 +1196,7 @@ def train(cfg: dict[str, Any], device: torch.device, base_dir: Path) -> None:
         optimizer = Adam(param_groups, betas=(0.9, 0.999))
     else:
         # ── single param group (legacy) ───────────────────────────────
-        trainable_params = [param for param in model.parameters() if param.requires_grad]
+        trainable_params = [param for param in model_without_ddp.parameters() if param.requires_grad]
         if not trainable_params:
             raise RuntimeError("No trainable parameters. Enable decoder training or LoRA.")
         optimizer = Adam(
@@ -1082,13 +1257,32 @@ def train(cfg: dict[str, Any], device: torch.device, base_dir: Path) -> None:
             scheduler.load_state_dict(state["scheduler"])
             print(f"[resume] scheduler state restored")
 
+    if distributed:
+        if device.type != "cuda":
+            raise RuntimeError("DistributedDataParallel training requires a CUDA device")
+        device_id = torch.cuda.current_device() if device.index is None else device.index
+        model = DistributedDataParallel(
+            model,
+            device_ids=[device_id],
+            output_device=device_id,
+            broadcast_buffers=False,
+            find_unused_parameters=bool(cfg.get("ddp_find_unused_parameters", False)),
+        )
+        print(
+            f"[ddp] enabled rank={rank}/{world_size} local_device=cuda:{device_id} "
+            f"find_unused_parameters={bool(cfg.get('ddp_find_unused_parameters', False))}"
+        )
+
     scaler = torch.cuda.amp.GradScaler(enabled=bool(cfg.get("amp", True)) and device.type == "cuda")
 
-    train_loader = make_loader(cfg, "train")
-    val_loader = make_loader(cfg, "val")
+    train_loader = make_loader(cfg, "train", distributed=distributed, rank=rank, world_size=world_size)
+    val_loader = make_loader(cfg, "val", distributed=distributed, rank=rank, world_size=world_size)
 
     start_epoch = resume_epoch + 1
     for epoch in range(start_epoch, int(cfg["n_epochs"]) + 1):
+        if distributed and hasattr(train_loader.sampler, "set_epoch"):
+            train_loader.sampler.set_epoch(epoch)
+
         train_metrics = run_epoch(
             model,
             train_loader,
@@ -1099,15 +1293,19 @@ def train(cfg: dict[str, Any], device: torch.device, base_dir: Path) -> None:
             scaler=scaler,
             amp=bool(cfg.get("amp", True)),
             threshold=float(cfg.get("threshold", 0.5)),
-            # grad_accum_steps=int(cfg.get("grad_accum_steps", 1)),
+            grad_accum_steps=int(cfg.get("grad_accum_steps", 1)),
+            rank=rank,
         )
-        print(
-            f"[epoch {epoch}] train loss {train_metrics['loss']:.4f} "
-            f"f1 {train_metrics['f1']:.4f} iou {train_metrics['iou']:.4f}"
-        )
+        if rank == 0:
+            print(
+                f"[epoch {epoch}] train loss {train_metrics['loss']:.4f} "
+                f"f1 {train_metrics['f1']:.4f} iou {train_metrics['iou']:.4f}"
+            )
 
         val_metrics = None
         if epoch % int(cfg.get("validate_every", 1)) == 0:
+            if distributed and hasattr(val_loader.sampler, "set_epoch"):
+                val_loader.sampler.set_epoch(epoch)
             with torch.no_grad():
                 val_metrics = run_epoch(
                     model,
@@ -1117,24 +1315,27 @@ def train(cfg: dict[str, Any], device: torch.device, base_dir: Path) -> None:
                     "val",
                     amp=False,
                     threshold=float(cfg.get("threshold", 0.5)),
-                    # eval_frame_chunk=int(cfg.get("eval_frame_chunk", 1)),
+                    eval_frame_chunk=int(cfg.get("eval_frame_chunk", 1)),
+                    rank=rank,
                 )
-            print(
-                f"[epoch {epoch}] val loss {val_metrics['loss']:.4f} "
-                f"f1 {val_metrics['f1']:.4f} iou {val_metrics['iou']:.4f}"
-            )
+            if rank == 0:
+                print(
+                    f"[epoch {epoch}] val loss {val_metrics['loss']:.4f} "
+                    f"f1 {val_metrics['f1']:.4f} iou {val_metrics['iou']:.4f}"
+                )
 
             # Save checkpoint with scheduler state
             checkpoint_dict = {
                 "epoch": epoch,
-                "model": model.state_dict(),
+                "model": model_without_ddp.state_dict(),
                 "optimizer": optimizer.state_dict(),
                 "scheduler": scheduler.state_dict(),
                 "metrics": val_metrics,
             }
-            torch.save(checkpoint_dict, save_dir / "latest.pt")
+            if rank == 0:
+                torch.save(checkpoint_dict, save_dir / "latest.pt")
 
-            if val_metrics["iou"] > best_iou:
+            if rank == 0 and val_metrics["iou"] > best_iou:
                 best_iou = val_metrics["iou"]
                 torch.save(checkpoint_dict, save_dir / "best_iou.pt")
                 print(f"[checkpoint] best_iou updated: {best_iou:.4f}")
@@ -1147,16 +1348,29 @@ def train(cfg: dict[str, Any], device: torch.device, base_dir: Path) -> None:
         if not scheduler_step_on_val:
             scheduler.step()
 
-        append_epoch_log(log_path, epoch, optimizer.param_groups[0]["lr"], train_metrics, log_fields, val_metrics)
+        if rank == 0:
+            append_epoch_log(log_path, epoch, optimizer.param_groups[0]["lr"], train_metrics, log_fields, val_metrics)
 
 
-def evaluate(cfg: dict[str, Any], device: torch.device, mode: str, base_dir: Path, *, test_subset: str = "") -> dict[str, float]:
+def evaluate(
+    cfg: dict[str, Any],
+    device: torch.device,
+    mode: str,
+    base_dir: Path,
+    *,
+    test_subset: str = "",
+    distributed: bool = False,
+    rank: int = 0,
+    world_size: int = 1,
+) -> dict[str, float]:
     model = build_model(cfg, device, base_dir)
     criterion = SegmentationLoss(loss_cfg=cfg.get("loss", {}))
-    loader = make_loader(cfg, mode)
+    loader = make_loader(cfg, mode, distributed=distributed, rank=rank, world_size=world_size)
     vis_dir = Path(cfg["visualization_dir"]) / mode if cfg.get("visualization_dir") else None
     if test_subset and vis_dir:
         vis_dir = vis_dir / test_subset
+    if distributed and hasattr(loader.sampler, "set_epoch"):
+        loader.sampler.set_epoch(0)
 
     with torch.no_grad():
         metrics = run_epoch(
@@ -1168,13 +1382,16 @@ def evaluate(cfg: dict[str, Any], device: torch.device, mode: str, base_dir: Pat
             amp=False,
             threshold=float(cfg.get("threshold", 0.5)),
             visualization_dir=vis_dir,
+            eval_frame_chunk=int(cfg.get("eval_frame_chunk", 1)),
+            rank=rank,
         )
     tag = f"[{mode}]" if not test_subset else f"[{mode}/{test_subset}]"
-    print(
-        f"{tag} loss {metrics['loss']:.4f} "
-        f"f1 {metrics['f1']:.4f} iou {metrics['iou']:.4f} "
-        f"precision {metrics['precision']:.4f} recall {metrics['recall']:.4f}"
-    )
+    if rank == 0:
+        print(
+            f"{tag} loss {metrics['loss']:.4f} "
+            f"f1 {metrics['f1']:.4f} iou {metrics['iou']:.4f} "
+            f"precision {metrics['precision']:.4f} recall {metrics['recall']:.4f}"
+        )
     return metrics
 
 
@@ -1196,7 +1413,11 @@ def print_test_summary(
 
     # ---- gather config info -----------------------------------------------
     train_info = [Path(p).stem for p in split_path_list(cfg.get("train_samples", ""))]
-    decoder = "DPT+FPN" if bool(cfg.get("use_dpt_fpn", False)) else "ProgressiveDecoder"
+    decoder = (
+        f"DPT+FPN/{cfg.get('neck_variant', 'fused32_pyramid')}"
+        if bool(cfg.get("use_dpt_fpn", False))
+        else "ProgressiveDecoder"
+    )
     lora_info = (
         f"rank={int(cfg.get('lora_rank', 0))} alpha={float(cfg.get('lora_alpha', 0)):.0f}"
         if bool(cfg.get("use_lora", False)) else "disabled"
@@ -1244,6 +1465,7 @@ def print_test_summary(
     print("\n".join(lines))
 
 
+@record
 def main() -> None:
     parser = argparse.ArgumentParser(description="DINOv3 ViT-L/16 pretrained comparison train/val/test")
     parser.add_argument("--config", type=str, default="configs/dinov3_vitl16_lora.yml")
@@ -1270,11 +1492,16 @@ def main() -> None:
     parser.add_argument("--lora_dropout", type=float, default=None)
     parser.add_argument("--lora_targets", type=str, default=None)
     parser.add_argument("--lora_layers", type=str, default=None)
+    parser.add_argument("--neck_variant", type=str, default=None, choices=["dpt_reassemble", "fused32_pyramid"])
+    parser.add_argument("--temporal_insert_level", type=str, default=None)
+    parser.add_argument("--use_image_stem_skip", type=str2bool, default=None)
     parser.add_argument("--save_dir", type=str, default=None)
     parser.add_argument("--visualization_dir", type=str, default=None)
     parser.add_argument("--augment_prob", type=float, default=None)
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--gpu_id", type=int, default=None)
+    parser.add_argument("--dist_backend", type=str, default=None)
+    parser.add_argument("--ddp_find_unused_parameters", type=str2bool, default=None)
     # TFCU adapter options
     parser.add_argument("--use_tfcu_adapter", type=str2bool, default=None)
     parser.add_argument("--num_clips", type=int, default=None)
@@ -1307,6 +1534,9 @@ def main() -> None:
         "lora_dropout": 0.0,
         "lora_targets": ",".join(DEFAULT_LORA_TARGETS),
         "lora_layers": "all",
+        "neck_variant": "fused32_pyramid",
+        "temporal_insert_level": "F32",
+        "use_image_stem_skip": False,
         "save_dir": "runs/dinov3_vitl16",
         "visualization_dir": "runs/dinov3_vitl16/vis",
         "checkpoint": "",
@@ -1314,6 +1544,8 @@ def main() -> None:
         "eval_frame_chunk": 1,
         "gpu_id": 0,
         "augment_prob": 0.75,
+        "dist_backend": "nccl",
+        "ddp_find_unused_parameters": False,
         # TFCU defaults
         "use_tfcu_adapter": False,
         "num_clips": 1,
@@ -1349,54 +1581,98 @@ def main() -> None:
     mode = cfg.get("type", "train")
     validate_config(cfg, mode)
 
-    set_seed(int(cfg.get("seed", 666666)))
-    device_str = cfg.get("device", "")
-    gpu_id = int(cfg.get("gpu_id", 0))
-    if not device_str:
-        if torch.cuda.is_available():
-            device_str = f"cuda:{gpu_id}"
+    distributed = False
+    rank = 0
+    local_rank = int(cfg.get("gpu_id", 0))
+    world_size = 1
+    try:
+        distributed, rank, local_rank, world_size = init_distributed_mode(cfg)
+        set_seed(int(cfg.get("seed", 666666)) + rank)
+
+        gpu_id = int(cfg.get("gpu_id", 0))
+        if distributed:
+            device = torch.device(f"cuda:{local_rank}")
         else:
-            device_str = "cpu"
-    device = torch.device(device_str)
-    print(f"[device] {device} (gpu_id={gpu_id})")
-    print(f"[mode] {mode}")
-    print(f"[dinov3] model={DINOV3_MODEL_NAME} weights={cfg['dinov3_weights']}")
-    decoder_tag = "DPT+FPN" if bool(cfg.get("use_dpt_fpn", False)) else "single-layer ProgressiveDecoder"
-    print(f"[dinov3] encoder: {decoder_tag}")
-    print(f"[lora] enabled={bool(cfg.get('use_lora', False))} rank={int(cfg.get('lora_rank', 4))}")
+            device_str = cfg.get("device", "")
+            if not device_str:
+                if torch.cuda.is_available():
+                    device_str = f"cuda:{gpu_id}"
+                else:
+                    device_str = "cpu"
+            device = torch.device(device_str)
 
-    if bool(cfg.get("use_tfcu_adapter", False)):
-        print(f"[tfcu] adapter enabled  num_clips={int(cfg.get('num_clips', 4))} "
-              f"num_frames={int(cfg.get('num_frames', 1))} "
-              f"memory_len={int(cfg.get('memory_len', 4))} "
-              f"use_memory={bool(cfg.get('use_memory', True))} "
-              f"val_full_video={bool(cfg.get('val_full_video', False))} "
-              f"test_full_video={bool(cfg.get('test_full_video', True))}")
+        print(f"[device] {device} (gpu_id={gpu_id}, rank={rank}, world_size={world_size})")
+        if distributed:
+            print(f"[ddp] backend={cfg.get('dist_backend', 'nccl')} local_rank={local_rank}")
+        print(f"[mode] {mode}")
+        print(f"[dinov3] model={DINOV3_MODEL_NAME} weights={cfg['dinov3_weights']}")
+        decoder_tag = (
+            f"DPT+FPN/{cfg.get('neck_variant', 'fused32_pyramid')}"
+            if bool(cfg.get("use_dpt_fpn", False))
+            else "single-layer ProgressiveDecoder"
+        )
+        print(f"[dinov3] encoder: {decoder_tag}")
+        print(f"[lora] enabled={bool(cfg.get('use_lora', False))} rank={int(cfg.get('lora_rank', 4))}")
 
-    if mode == "train":
-        train(cfg, device, base_dir)
-    elif mode == "test":
-        # Run all predefined test subsets sequentially
-        saved_test_samples = cfg.get("test_samples", None)
-        checkpoint = cfg.get("checkpoint", "")
+        if bool(cfg.get("use_tfcu_adapter", False)):
+            print(f"[tfcu] adapter enabled  num_clips={int(cfg.get('num_clips', 4))} "
+                  f"num_frames={int(cfg.get('num_frames', 1))} "
+                  f"memory_len={int(cfg.get('memory_len', 4))} "
+                  f"use_memory={bool(cfg.get('use_memory', True))} "
+                  f"val_full_video={bool(cfg.get('val_full_video', False))} "
+                  f"test_full_video={bool(cfg.get('test_full_video', True))}")
 
-        results: list[dict[str, Any]] = []
-        for subset in TEST_SUITE:
-            # Replace test_samples for this subset
-            cfg["test_samples"] = subset["samples"]
-            print(f"\n{'─'*50}")
-            print(f"[test] running subset: {subset['key']}  ({subset['samples']})")
-            print(f"{'─'*50}")
-            metrics = evaluate(cfg, device, "test", base_dir, test_subset=subset["key"])
-            results.append({"subset": subset["key"], "metrics": dict(metrics)})
+        if mode == "train":
+            train(
+                cfg,
+                device,
+                base_dir,
+                distributed=distributed,
+                rank=rank,
+                world_size=world_size,
+            )
+        elif mode == "test":
+            # Run all predefined test subsets sequentially
+            saved_test_samples = cfg.get("test_samples", None)
+            checkpoint = cfg.get("checkpoint", "")
 
-        # Restore original test_samples (if any)
-        if saved_test_samples is not None:
-            cfg["test_samples"] = saved_test_samples
+            results: list[dict[str, Any]] = []
+            for subset in TEST_SUITE:
+                # Replace test_samples for this subset
+                cfg["test_samples"] = subset["samples"]
+                print(f"\n{'─'*50}")
+                print(f"[test] running subset: {subset['key']}  ({subset['samples']})")
+                print(f"{'─'*50}")
+                metrics = evaluate(
+                    cfg,
+                    device,
+                    "test",
+                    base_dir,
+                    test_subset=subset["key"],
+                    distributed=distributed,
+                    rank=rank,
+                    world_size=world_size,
+                )
+                results.append({"subset": subset["key"], "metrics": dict(metrics)})
 
-        print_test_summary(results, cfg, checkpoint)
-    else:
-        evaluate(cfg, device, mode, base_dir)
+            # Restore original test_samples (if any)
+            if saved_test_samples is not None:
+                cfg["test_samples"] = saved_test_samples
+
+            if rank == 0:
+                print_test_summary(results, cfg, checkpoint)
+        else:
+            evaluate(
+                cfg,
+                device,
+                mode,
+                base_dir,
+                distributed=distributed,
+                rank=rank,
+                world_size=world_size,
+            )
+    finally:
+        cleanup_distributed()
 
 
 if __name__ == "__main__":

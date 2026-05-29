@@ -52,6 +52,9 @@ class TFCUInpaintAdapter(nn.Module):
             use_spatial_pool=use_spatial_pool,
             pool_size=16,
         )
+        if not self.use_memory:
+            for param in self.memory_attn.parameters():
+                param.requires_grad = False
 
         # Project temporal-enhanced features back to residual space
         self.temporal_proj = nn.Conv2d(channels, channels, kernel_size=1)

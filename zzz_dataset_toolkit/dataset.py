@@ -10,7 +10,8 @@ import albumentations as A
 import cv2
 import numpy as np
 import torch
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, Sampler
+from torch.utils.data.distributed import DistributedSampler
 from torchvision import transforms
 
 from .transforms import (
@@ -23,6 +24,28 @@ from .transforms import (
 
 
 SampleList = Union[str, os.PathLike[str], Sequence[str], Sequence[Sequence[str]], np.ndarray]
+
+
+class DistributedEvalSampler(Sampler):
+    """Shard eval datasets across ranks without padding duplicate samples."""
+
+    def __init__(self, dataset: Dataset, num_replicas: int, rank: int) -> None:
+        if num_replicas <= 0:
+            raise ValueError(f"num_replicas must be positive, got {num_replicas}")
+        if rank < 0 or rank >= num_replicas:
+            raise ValueError(f"rank must be in [0, {num_replicas}), got {rank}")
+        self.dataset = dataset
+        self.num_replicas = num_replicas
+        self.rank = rank
+
+    def __iter__(self):
+        return iter(range(self.rank, len(self.dataset), self.num_replicas))
+
+    def __len__(self) -> int:
+        return (len(self.dataset) + self.num_replicas - 1 - self.rank) // self.num_replicas
+
+    def set_epoch(self, epoch: int) -> None:
+        return None
 
 
 def _numeric_key(path_or_name: str | os.PathLike[str]) -> int | str:
@@ -655,6 +678,9 @@ def build_dataloader(
     test_max_clips: int = 4,
     val_full_video: bool = False,
     test_full_video: bool = True,
+    distributed: bool = False,
+    rank: int = 0,
+    world_size: int = 1,
     **dataset_kwargs,
 ):
     dataset = VideoInpaintingDataset(
@@ -672,10 +698,24 @@ def build_dataloader(
         shuffle = mode == "train"
     if drop_last is None:
         drop_last = mode == "train"
+    sampler = None
+    if distributed:
+        if mode == "train":
+            sampler = DistributedSampler(
+                dataset,
+                num_replicas=world_size,
+                rank=rank,
+                shuffle=shuffle,
+                drop_last=drop_last,
+            )
+        else:
+            sampler = DistributedEvalSampler(dataset, num_replicas=world_size, rank=rank)
+        shuffle = False
     return DataLoader(
         dataset=dataset,
         batch_size=batch_size,
         shuffle=shuffle,
+        sampler=sampler,
         num_workers=num_workers,
         pin_memory=pin_memory,
         drop_last=drop_last,

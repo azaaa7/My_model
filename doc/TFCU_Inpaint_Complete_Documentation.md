@@ -3,7 +3,7 @@
 > 项目：`/home/wzk/Exp/My_model`  
 > 主脚本：`train_val_test_dinov3_lora.py`  
 > 配置：`configs/dinov3_vitl16_lora_tfcu_inpaint.yml`  
-> 基于 DINOv3 ViT-L/16 + LoRA + DPT-FPN，在 FPN P4 层级注入轻量时序 Adapter，用于视频 inpainting 伪造检测。
+> 基于 DINOv3 ViT-L/16 + LoRA + DPT-FPN，在 fused F32 层级注入轻量时序 Adapter，用于视频 inpainting 伪造检测。
 
 ---
 
@@ -22,17 +22,15 @@
   │
   ├─ DINOv3 ViT-L/16 backbone（冻结）
   │   └─ LoRA 注入：attn.qkv, attn.proj, mlp.fc1, mlp.fc2
-  │       Blocks: 11, 15, 19, 23 → 4 层 patch tokens [1024-dim, 32×32]
+  │       Blocks: 5, 11, 17, 23 → 4 层 patch tokens [1024-dim, 32×32]
   │
-  ├─ DPT Reassemble Neck
-  │   ├─ block 11 → ReassembleBlock("x4")    → P2 [BNT, 256, 128, 128]
-  │   ├─ block 15 → ReassembleBlock("x2")    → P3 [BNT, 256,  64,  64]
-  │   ├─ block 19 → ReassembleBlock("x1")    → P4 [BNT, 256,  32,  32]
-  │   └─ block 23 → ReassembleBlock("down2") → P5 [BNT, 256,  16,  16]
+  ├─ ViTMultiLayerFusionPyramidNeck
+  │   ├─ 每个 block feature: 1×1 projection → GN → GELU → ConvGNAct
+  │   ├─ concat + fusion → F32 [BNT, 256, 32, 32]
   │
-  ├─ ═══════ TFCU-Inpaint Adapter @ P4 ═══════
+  ├─ ═══════ TFCU-Inpaint Adapter @ F32 ═══════
   │   │
-  │   ├─ P4 reshape → [B, N, T, 256, 32, 32]
+  │   ├─ F32 reshape → [B, N, T, 256, 32, 32]
   │   │
   │   ├─ [1] LocalTemporalDifferenceModule
   │   │     每帧与前一帧差分 (x_t − x_{t-1}) → 门控融合
@@ -49,11 +47,18 @@
   │   │
   │   ├─ temporal = stack(enhanced) → reshape [BNT, 256, 32, 32]
   │   ├─ temporal = temporal_proj(temporal)              # 1×1 Conv
-  │   └─ P4_out = P4 + α * temporal                      # α 初始 = 0
+  │   └─ F32_out = F32 + α * temporal                    # α 初始 = 0
+  │
+  ├─ build pyramid from enhanced F32
+  │   ├─ P5 = downsample(F32_out) → [BNT, 256,  16,  16]
+  │   ├─ P4 = conv(F32_out)       → [BNT, 256,  32,  32]
+  │   ├─ P3 = upsample(F32_out)   → [BNT, 256,  64,  64]
+  │   └─ P2 = upsample(F32_out)   → [BNT, 256, 128, 128]
+  │      （可选 image stem skip 加到 P2/P3，scale 初始为 0）
   │
   ├─ FPNDecoder
   │   ├─ P5 → F5 [BNT, 256, 16, 16]
-  │   ├─ P4_out + upsample(F5) → F4 [BNT, 256, 32, 32]
+  │   ├─ P4 + upsample(F5) → F4 [BNT, 256, 32, 32]
   │   ├─ P3 + upsample(F4) → F3 [BNT, 256, 64, 64]
   │   ├─ P2 + upsample(F3) → F2 [BNT, 256, 128, 128]
   │   ├─ F2 → upsample(256²) → Conv(256→128)
@@ -69,9 +74,10 @@
 | 原则 | 实现 |
 |------|------|
 | **不重写 backbone** | VideoInpaintTFCU wrapper 包裹现有 DINOv3ViTL16InpaintingDetector |
-| **可退化** | `α=0` 时 P4_out = P4，模型等价于原始单帧 DPT-FPN |
+| **可退化** | `α=0` 时 F32_out = F32，temporal adapter 初始不扰动 fused feature |
 | **因果 memory** | clip n 只能 attend clip 0..n-1，禁止偷看未来 |
 | **detach memory** | memory 前 detach，避免跨 clip 梯度爆炸 |
+| **统一插入点** | temporal / 后续 prompt 都作用在 F32，P2/P3/P4/P5 由 enhanced F32 构建 |
 
 ---
 
@@ -90,7 +96,7 @@ My_model/
 │   ├── __init__.py                        模块导出
 │   ├── losses.py                          损失函数（9 种）
 │   ├── metrics.py                         IoU/F1/Precision/Recall
-│   ├── dinov3_dpt_fpn.py                  DPTReassembleNeck / FPNDecoder
+│   ├── dinov3_dpt_fpn.py                  Fused32/DPT necks / FPNDecoder
 │   ├── video_inpaint_tfcu.py              ★ VideoInpaintTFCU wrapper
 │   └── temporal/
 │       ├── __init__.py
@@ -118,13 +124,13 @@ My_model/
 ### 3.1 `DINOv3ViTL16InpaintingDetector`（Base Model）
 
 **文件**：`train_val_test_dinov3_lora.py`（类定义在该脚本内）  
-**依赖**：`my_model/dinov3_dpt_fpn.py`（DPTReassembleNeck, FPNDecoder）
+**依赖**：`my_model/dinov3_dpt_fpn.py`（ViTMultiLayerFusionPyramidNeck, DPTReassembleNeck, FPNDecoder）
 
 | 组件 | 参数量 | 状态 |
 |------|--------|------|
 | DINOv3 ViT-L/24 backbone | ~304M | ❄️ 冻结 |
 | LoRA（r=32, α=64） | ~6M | 🔥 训练 |
-| DPTReassembleNeck | ~3.7M | 🔥 训练 |
+| ViTMultiLayerFusionPyramidNeck | 依 layers/channel 而定 | 🔥 训练 |
 | FPNDecoder | ~1.3M | 🔥 训练 |
 
 **关键方法**：
@@ -133,16 +139,15 @@ My_model/
 # 训练/测试统一入口（兼容旧格式）
 def forward(self, clip: [B,T,3,H,W]) -> [B,T,1,H,W]:
     frames = clip.reshape(B*T, 3, H, W)
-    P2, P3, P4, P5 = self.extract_fpn_features(frames)
-    logits = self.decode_fpn(P2, P3, P4, P5)
+    features = self.extract_pyramid_features(frames, return_f32=False)
+    logits = self.decode_fpn(features["p2"], features["p3"], features["p4"], features["p5"])
     return logits.reshape(B, T, 1, H, W)
 
 # TFCU wrapper 调用的接口
-def extract_fpn_features(self, frames: [B_flat, 3, H, W]) -> (P2, P3, P4, P5):
+def extract_pyramid_features(self, frames: [B_flat, 3, H, W], return_f32=True) -> dict:
     # 输入：flat batch（B_flat = B*N*T 或 chunk）
-    # 内部调 DinoMultiLayerEncoder → DPTReassembleNeck
-    # 输出：P2 [B_flat,256,128,128] P3 [B_flat,256,64,64]
-    #       P4 [B_flat,256,32,32]   P5 [B_flat,256,16,16]
+    # fused32_pyramid: DinoMultiLayerEncoder → F32 → P2/P3/P4/P5
+    # 输出：F32 [B_flat,256,32,32], P2/P3/P4/P5
 
 def decode_fpn(self, P2, P3, P4, P5) -> [B_flat, 1, 512, 512]:
     # 内部调 FPNDecoder
@@ -166,9 +171,9 @@ class VideoInpaintTFCU(nn.Module):
     def forward(self, video: [B,N,T,3,H,W] or [B,T,3,H,W]) -> logits:
         # 1. 兼容旧格式：5D → 补 N=1
         # 2. flatten → [BNT,3,H,W]
-        # 3. encoder_chunk 分流：每 chunk 帧过 extract_fpn_features → concat
-        # 4. P4 过 temporal_adapter(B,N,T)
-        # 5. decode_fpn(P2, P3, P4_out, P5)
+        # 3. encoder_chunk 分流：每 chunk 帧过 extract_pyramid_features(return_f32=True)
+        # 4. F32 过 temporal_adapter(B,N,T)
+        # 5. 从 enhanced F32 构建 P2/P3/P4/P5，再 decode_fpn
         # 6. reshape → [B,N,T,1,H,W]
 ```
 
@@ -186,8 +191,8 @@ class VideoInpaintTFCU(nn.Module):
 
 ```python
 class TFCUInpaintAdapter(nn.Module):
-    def forward(self, P4: [BNT, C, H, W], B, N, T) -> [BNT, C, H, W]:
-        x = P4.reshape(B, N, T, C, H, W)
+    def forward(self, f32: [BNT, C, H, W], B, N, T) -> [BNT, C, H, W]:
+        x = f32.reshape(B, N, T, C, H, W)
 
         # [1] 局部时序差分（clip 内帧间）
         x = self.local(x)
@@ -208,7 +213,7 @@ class TFCUInpaintAdapter(nn.Module):
         # [3] 残差注入
         temporal = stack(enhanced).reshape(BNT, C, H, W)
         temporal = self.temporal_proj(temporal)
-        return P4 + self.alpha * temporal
+        return f32 + self.alpha * temporal
 ```
 
 | 属性 | 说明 |
@@ -284,7 +289,7 @@ class TFCUInpaintAdapter(nn.Module):
 ### 3.6 `MaskPromptEncoder`（备用）
 
 **文件**：`my_model/temporal/mask_prompt_encoder.py`  
-当前 **未启用**（`use_mask_prompt: false`）。功能：将预测 mask + Sobel 边界编码为空间 prompt，后续版本可 fuse 到 temporal features。
+当前 **未启用**（`use_mask_prompt: false`）。功能：将预测 mask + Sobel 边界编码为空间 prompt。后续版本的统一接入点应为 F32 current feature：`F32 → coarse mask/boundary prompt → prompt residual → temporal adapter → enhanced F32 → pyramid`，不要接到 P4/P5。
 
 ---
 
@@ -355,6 +360,13 @@ python train_val_test_dinov3_lora.py \
   --gpu_id 0 \
   --batch_size 1 \
   --grad_accum_steps 8
+
+# 8 卡 DDP。每个 rank 使用 DistributedSampler，指标在 epoch 末 all-reduce。
+torchrun --nproc_per_node=8 train_val_test_dinov3_lora.py \
+  --config configs/dinov3_vitl16_lora_tfcu_inpaint.yml \
+  --type train \
+  --batch_size 1 \
+  --grad_accum_steps 1
 ```
 
 ### 6.2 训练循环（`run_epoch`）
@@ -372,7 +384,7 @@ python train_val_test_dinov3_lora.py \
       logits, loss_masks = align_logits_and_masks(logits, masks)
 
     loss = criterion(logits, loss_masks)
-    (loss / grad_accum_steps).backward()
+    (loss / grad_accum_steps).backward()  # DDP 累积步使用 no_sync 减少通信
 
     if step % grad_accum_steps == 0:
       optimizer.step()
@@ -424,6 +436,12 @@ python train_val_test_dinov3_lora.py \
   --config configs/dinov3_vitl16_lora_tfcu_inpaint.yml \
   --type test \
   --gpu_id 0 \
+  --checkpoint runs/dinov3_vitl16_tfcu_inpaint/best_iou.pt
+
+# 多卡测试：各 rank 分片跑不同样本，最后汇总 loss/F1/IoU 等指标。
+torchrun --nproc_per_node=8 train_val_test_dinov3_lora.py \
+  --config configs/dinov3_vitl16_lora_tfcu_inpaint.yml \
+  --type test \
   --checkpoint runs/dinov3_vitl16_tfcu_inpaint/best_iou.pt
 ```
 

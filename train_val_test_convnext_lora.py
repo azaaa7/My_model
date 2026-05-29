@@ -92,7 +92,14 @@ def validate_config(cfg: dict[str, Any], mode: str) -> None:
         raise ValueError("Config validation failed:\n  - " + "\n  - ".join(errors))
 
 
-def make_loader(cfg: dict[str, Any], mode: str):
+def make_loader(
+    cfg: dict[str, Any],
+    mode: str,
+    *,
+    distributed: bool = False,
+    rank: int = 0,
+    world_size: int = 1,
+):
     samples_key = "test_samples" if mode == "test" else "val_samples" if mode == "val" else "train_samples"
     return build_dataloader(
         samples=cfg[samples_key],
@@ -113,6 +120,9 @@ def make_loader(cfg: dict[str, Any], mode: str):
         test_max_clips=cfg.get("test_max_clips", 4),
         val_full_video=cfg.get("val_full_video", False),
         test_full_video=cfg.get("test_full_video", True),
+        distributed=distributed,
+        rank=rank,
+        world_size=world_size,
     )
 
 
